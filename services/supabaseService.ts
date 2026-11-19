@@ -1,4 +1,4 @@
-import { supabase } from '../lib/supabase';
+import { supabase, normalizedSupabaseUrl } from '../lib/supabase';
 import { User, UserRole, InventoryItem, Transaction, ServiceOrder, VehicleSection, LaborTemplate, Client, Tenant, UTVPassport } from '../types';
 
 const getClient = () => {
@@ -1282,14 +1282,9 @@ NOTIFY pgrst, 'reload schema';
     }>;
   }> {
     const rawUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
-    let supabaseHost = 'Não configurado';
-    if (rawUrl) {
-      try {
-        supabaseHost = new URL(rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`).host;
-      } catch {
-        supabaseHost = rawUrl;
-      }
-    }
+    const supabaseHost = normalizedSupabaseUrl
+      ? `${normalizedSupabaseUrl}${rawUrl && rawUrl.replace(/\/+$/, '') !== normalizedSupabaseUrl ? ' (URL sanitizada automaticamente)' : ''}`
+      : 'Não configurado';
 
     const specs = [
       { table: 'tenants', label: 'Oficinas (tenants)', scoped: false },
@@ -1325,7 +1320,7 @@ NOTIFY pgrst, 'reload schema';
 
     for (const spec of specs) {
       try {
-        const totalRes = await client.from(spec.table).select('id', { count: 'exact', head: true });
+        const totalRes = await client.from(spec.table).select('id', { count: 'exact' }).limit(1);
         if (totalRes.error) {
           const errDetail = totalRes.error.code
             ? `[${totalRes.error.code}] ${totalRes.error.message}`
@@ -1345,8 +1340,9 @@ NOTIFY pgrst, 'reload schema';
         if (spec.scoped) {
           const scopedRes = await client
             .from(spec.table)
-            .select('id', { count: 'exact', head: true })
-            .eq('tenantId', tenantId);
+            .select('id', { count: 'exact' })
+            .eq('tenantId', tenantId)
+            .limit(1);
           if (scopedRes.error) {
             const errDetail = scopedRes.error.code
               ? `[${scopedRes.error.code}] ${scopedRes.error.message}`
