@@ -323,6 +323,22 @@ const App: React.FC = () => {
     cleanReplace: boolean;
     summary: string;
   } | null>(null);
+  const [isRunningDiag, setIsRunningDiag] = useState<boolean>(false);
+  const [copiedDiag, setCopiedDiag] = useState<boolean>(false);
+  const [diagReport, setDiagReport] = useState<{
+    configured: boolean;
+    supabaseHost: string;
+    tenantId: string;
+    checkedAt: string;
+    tables: Array<{
+      table: string;
+      label: string;
+      countForTenant: number | null;
+      countTotal: number | null;
+      ok: boolean;
+      error?: string;
+    }>;
+  } | null>(null);
   const [editingCategory, setEditingCategory] = useState<{ original: string; current: string } | null>(null);
   const [newCategoryName, setNewCategoryName] = useState("");
   const [labelSearchTerm, setLabelSearchTerm] = useState("");
@@ -976,16 +992,23 @@ const App: React.FC = () => {
       const tasks = [
         { name: 'tenants', label: 'Oficinas', action: () => supabaseService.saveTenant(currentTenant) },
         { name: 'users', label: 'Usuários', action: () => supabaseService.saveUser(scopedUsers) },
-        { name: 'items', label: 'Peças & Estoque', action: () => supabaseService.saveItem(scopedItems) },
-        { name: 'history', label: 'Movimentações', action: () => supabaseService.saveTransaction(scopedHistory) },
-        { name: 'service_orders', label: 'Ordens de Serviço', action: () => supabaseService.saveServiceOrder(scopedOrders) },
         { name: 'vehicle_sections', label: 'Setores do Veículo', action: () => supabaseService.saveVehicleSection(scopedSections) },
         { name: 'labor_templates', label: 'Modelos de Mão de Obra', action: () => supabaseService.saveLaborTemplate(scopedTemplates) },
         { name: 'clients', label: 'Clientes', action: () => supabaseService.saveClient(scopedClients) },
+        { name: 'items', label: 'Peças & Estoque', action: () => supabaseService.saveItem(scopedItems) },
         { name: 'utv_passports', label: 'Passaporte UTV', action: () => supabaseService.saveUTVPassport(scopedPassports) },
+        { name: 'service_orders', label: 'Ordens de Serviço', action: () => supabaseService.saveServiceOrder(scopedOrders) },
+        { name: 'history', label: 'Movimentações', action: () => supabaseService.saveTransaction(scopedHistory) },
       ];
 
-      await Promise.allSettled(tasks.map(t => t.action()));
+      // Execução sequencial em ordem segura de dependências (evita erro de chave estrangeira)
+      for (const t of tasks) {
+        try {
+          await t.action();
+        } catch (err) {
+          console.error(`[Sync] Erro em ${t.name}:`, err);
+        }
+      }
 
       const tableErrors = supabaseService.getTableErrors();
       const missingTables = supabaseService.getMissingTables();
@@ -1257,6 +1280,93 @@ const App: React.FC = () => {
       }
     };
     reader.readAsText(file);
+  };
+
+  // --- DIAGNÓSTICO REAL (LOCAL VS SUPABASE) ---
+  const handleRunSupabaseDiagnostics = async () => {
+    setIsRunningDiag(true);
+    try {
+      const report = await supabaseService.runDiagnostics(currentTenant.id);
+      setDiagReport(report);
+    } catch (e: any) {
+      showAlert('Erro no Diagnóstico', e?.message || 'Não foi possível consultar o Supabase.', 'error');
+    } finally {
+      setIsRunningDiag(false);
+    }
+  };
+
+  // --- FORÇAR ESPELHO LIMPO (ESTE NAVEGADOR -> SUPABASE) ---
+  const handlePushLocalToSupabaseClean = () => {
+    if (!supabaseService.isAvailable()) {
+      showAlert(
+        'Supabase Não Conectado Aqui',
+        'Este endereço não tem as variáveis do Supabase configuradas (é a Área de Teste). Use o botão "Exportar Backup Completo (.json)" aqui e importe dentro do seu site publicado no Netlify.',
+        'info'
+      );
+      return;
+    }
+
+    showConfirm(
+      'Forçar Espelho Limpo (Navegador → Supabase)',
+      `Esta ação vai APAGAR os dados antigos da oficina "${currentTenant.name}" no Supabase e gravar exatamente o que está na sua tela agora:\n\n• ${items.length} peças\n• ${serviceOrders.length} Ordens de Serviço\n• ${clients.length} clientes\n• ${utvPassports.length} passaportes UTV\n• ${laborTemplates.length} modelos de M.O.\n• ${vehicleSections.length} setores\n• ${history.length} movimentações\n\nAssim, qualquer celular ou PC que abrir o link do Netlify verá os mesmos dados. Deseja prosseguir?`,
+      async () => {
+        setIsMigratingBackup(true);
+        setSyncError(null);
+        try {
+          const result = await supabaseService.importFullTenantBackup(
+            currentTenant.id,
+            {
+              tenant: currentTenant,
+              users,
+              items,
+              history,
+              serviceOrders,
+              vehicleSections,
+              laborTemplates,
+              clients,
+              utvPassports
+            },
+            true
+          );
+
+          const summary = `${items.length} peças, ${serviceOrders.length} O.S., ${clients.length} clientes, ${utvPassports.length} passaportes UTV, ${laborTemplates.length} M.O., ${vehicleSections.length} setores e ${history.length} movimentações.`;
+          setBackupLastReport({
+            timestamp: new Date().toLocaleString('pt-BR'),
+            mode: 'import',
+            syncedToSupabase: result.success,
+            cleanReplace: true,
+            summary
+          });
+
+          const diag = await supabaseService.runDiagnostics(currentTenant.id);
+          setDiagReport(diag);
+
+          const errKeys = Object.keys(result.errors);
+          if (result.success) {
+            setSyncError(null);
+            showAlert(
+              'Supabase Atualizado com Sucesso!',
+              `Todos os dados deste navegador foram gravados no Supabase em modo Espelho Limpo 1:1!\n\nAgora abra o link do Netlify no celular (ou recarregue a página) — os dados estarão 100% iguais.`,
+              'success'
+            );
+          } else {
+            const errDetail = errKeys.map(k => `• ${k}: ${result.errors[k]}`).join('\n');
+            setSyncError(`Pendência (${errKeys.length}) — ${errKeys[0]}: ${result.errors[errKeys[0]]}`);
+            showAlert(
+              'Erro Parcial ao Gravar no Supabase',
+              `Algumas tabelas retornaram erro real do Supabase:\n\n${errDetail}\n\nClique em "Copiar Relatório" abaixo e envie para análise.`,
+              'error'
+            );
+          }
+        } catch (err: any) {
+          console.error('Erro no envio limpo para Supabase:', err);
+          setSyncError(`Erro: ${err?.message || 'Falha no envio'}`);
+          showAlert('Erro no Envio', err?.message || 'Falha ao enviar dados para o Supabase.', 'error');
+        } finally {
+          setIsMigratingBackup(false);
+        }
+      }
+    );
   };
 
   // --- AUTH STATE ---
@@ -5306,19 +5416,38 @@ const App: React.FC = () => {
           
           <div className="flex flex-wrap items-center gap-2 sm:gap-3">
             {supabaseService.isAvailable() && (
-              <button 
-                type="button"
-                onClick={() => setShowSqlModal(true)}
-                className={`flex items-center gap-1.5 px-3 sm:px-3.5 py-2 sm:py-2.5 rounded-xl text-[9px] font-black uppercase transition-all active:scale-95 border ${
-                  supabaseService.isTableMissing('tenants')
-                    ? 'bg-amber-500/10 border-amber-500/40 text-amber-300 hover:bg-amber-500/20'
-                    : 'bg-zinc-800 border-zinc-700/60 text-zinc-300 hover:bg-zinc-700'
-                }`}
-                title="Ver e copiar código SQL para criação das tabelas no Supabase"
-              >
-                <FileText size={13} className={supabaseService.isTableMissing('tenants') ? 'text-amber-400' : 'text-green-400'} />
-                <span>Script SQL Supabase</span>
-              </button>
+              <>
+                <button 
+                  type="button"
+                  onClick={() => {
+                    setActiveTab('config');
+                    setConfigSubTab('backup');
+                    handleRunSupabaseDiagnostics();
+                  }}
+                  className={`flex items-center gap-1.5 px-3 sm:px-3.5 py-2 sm:py-2.5 rounded-xl text-[9px] font-black uppercase transition-all active:scale-95 border ${
+                    syncError
+                      ? 'bg-red-500/15 border-red-500/40 text-red-300 hover:bg-red-500/25'
+                      : 'bg-zinc-800 border-zinc-700/60 text-zinc-300 hover:bg-zinc-700'
+                  }`}
+                  title="Testar tabelas no Supabase e comparar Local vs Nuvem"
+                >
+                  <Database size={13} className={syncError ? 'text-red-400' : 'text-blue-400'} />
+                  <span>Diagnóstico</span>
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => setShowSqlModal(true)}
+                  className={`flex items-center gap-1.5 px-3 sm:px-3.5 py-2 sm:py-2.5 rounded-xl text-[9px] font-black uppercase transition-all active:scale-95 border ${
+                    supabaseService.isTableMissing('tenants')
+                      ? 'bg-amber-500/10 border-amber-500/40 text-amber-300 hover:bg-amber-500/20'
+                      : 'bg-zinc-800 border-zinc-700/60 text-zinc-300 hover:bg-zinc-700'
+                  }`}
+                  title="Ver e copiar código SQL para criação das tabelas no Supabase"
+                >
+                  <FileText size={13} className={supabaseService.isTableMissing('tenants') ? 'text-amber-400' : 'text-green-400'} />
+                  <span>Script SQL Supabase</span>
+                </button>
+              </>
             )}
 
             <button 
@@ -8878,6 +9007,140 @@ const App: React.FC = () => {
                       </p>
                     </div>
                   )}
+
+                  {/* PASSO 3 / DIAGNÓSTICO EM TEMPO REAL: LOCAL (PC) VS NUVEM (SUPABASE) */}
+                  <div className="bg-black border border-zinc-800 rounded-[2rem] p-6 sm:p-7 space-y-5">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-800 pb-4">
+                      <div>
+                        <span className="px-3 py-1 bg-zinc-900 border border-zinc-700 text-amber-400 text-[9px] font-black uppercase tracking-widest rounded-lg">
+                          Diagnóstico Real • PC vs Celular (Supabase)
+                        </span>
+                        <h5 className="text-base font-black uppercase italic text-white mt-2">
+                          Auditoria de Sincronização na Nuvem
+                        </h5>
+                        <p className="text-xs text-zinc-400 mt-1">
+                          Compare exatamente quantos registros existem neste navegador contra o que está salvo de verdade no Supabase (que o celular lê).
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        {supabaseService.isAvailable() && (
+                          <button
+                            type="button"
+                            disabled={isMigratingBackup}
+                            onClick={handlePushLocalToSupabaseClean}
+                            className="py-3 px-4 bg-amber-500 hover:bg-amber-400 text-black font-black uppercase text-[10px] tracking-wider rounded-xl active:scale-95 transition-all flex items-center gap-1.5 disabled:opacity-50"
+                          >
+                            <Zap size={14} /> {isMigratingBackup ? 'Enviando...' : 'Forçar Envio Limpo (PC → Supabase)'}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={isRunningDiag}
+                          onClick={handleRunSupabaseDiagnostics}
+                          className="py-3 px-4 bg-zinc-800 hover:bg-zinc-700 text-white font-black uppercase text-[10px] tracking-wider rounded-xl active:scale-95 transition-all flex items-center gap-1.5 border border-zinc-700 disabled:opacity-50"
+                        >
+                          <RefreshCw size={14} className={isRunningDiag ? 'animate-spin' : ''} />
+                          {isRunningDiag ? 'Verificando...' : 'Testar Tabelas Agora'}
+                        </button>
+                      </div>
+                    </div>
+
+                    {diagReport && (
+                      <div className="space-y-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-zinc-400">
+                          <div className="flex flex-wrap gap-x-4 gap-y-1">
+                            <span>Site: <strong className="text-white">{typeof window !== 'undefined' ? window.location.host : '-'}</strong></span>
+                            <span>Supabase: <strong className="text-green-400">{diagReport.supabaseHost}</strong></span>
+                            <span>Oficina ID: <strong className="text-blue-400">{diagReport.tenantId}</strong></span>
+                            <span>Verificado: <strong className="text-zinc-200">{diagReport.checkedAt}</strong></span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const localCounts: Record<string, number> = {
+                                tenants: tenants.length,
+                                users: users.length,
+                                items: items.length,
+                                service_orders: serviceOrders.length,
+                                clients: clients.length,
+                                utv_passports: utvPassports.length,
+                                labor_templates: laborTemplates.length,
+                                vehicle_sections: vehicleSections.length,
+                                history: history.length
+                              };
+                              const lines = [
+                                `=== DIAGNÓSTICO HPS CONTROL ===`,
+                                `Site: ${typeof window !== 'undefined' ? window.location.href : '-'}`,
+                                `Supabase Host: ${diagReport.supabaseHost}`,
+                                `Tenant Ativo: ${diagReport.tenantId} (${currentTenant.name})`,
+                                `Status Barra: ${syncError || 'OK (Sem erro)'}`,
+                                `Verificado em: ${diagReport.checkedAt}`,
+                                `---`,
+                                ...diagReport.tables.map(t =>
+                                  `${t.ok ? 'OK' : 'ERRO'} | ${t.table} | Local=${localCounts[t.table] ?? '-'} | Supabase(Oficina)=${t.countForTenant ?? '-'} | Supabase(Total)=${t.countTotal ?? '-'}${t.error ? ` | MOTIVO: ${t.error}` : ''}`
+                                )
+                              ].join('\n');
+                              navigator.clipboard.writeText(lines);
+                              setCopiedDiag(true);
+                              setTimeout(() => setCopiedDiag(false), 2500);
+                            }}
+                            className="px-3 py-1.5 bg-green-500 hover:bg-green-400 text-black font-sans font-black uppercase text-[9px] rounded-lg flex items-center gap-1"
+                          >
+                            {copiedDiag ? <Check size={12} /> : <Copy size={12} />}
+                            {copiedDiag ? 'Relatório Copiado!' : 'Copiar Relatório'}
+                          </button>
+                        </div>
+
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left border-collapse text-xs">
+                            <thead>
+                              <tr className="border-b border-zinc-800 text-[9px] font-black uppercase tracking-wider text-zinc-500">
+                                <th className="py-2.5 px-3">Tabela</th>
+                                <th className="py-2.5 px-3 text-center">Neste PC (Local)</th>
+                                <th className="py-2.5 px-3 text-center">No Supabase (Oficina)</th>
+                                <th className="py-2.5 px-3">Status / Erro Exato</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-zinc-800/60">
+                              {diagReport.tables.map(row => {
+                                const localCountMap: Record<string, number> = {
+                                  tenants: tenants.length,
+                                  users: users.length,
+                                  items: items.length,
+                                  service_orders: serviceOrders.length,
+                                  clients: clients.length,
+                                  utv_passports: utvPassports.length,
+                                  labor_templates: laborTemplates.length,
+                                  vehicle_sections: vehicleSections.length,
+                                  history: history.length
+                                };
+                                const localVal = localCountMap[row.table] ?? 0;
+                                const isDiff = row.ok && row.countForTenant !== null && row.countForTenant !== localVal;
+                                return (
+                                  <tr key={row.table} className="hover:bg-zinc-900/50">
+                                    <td className="py-2.5 px-3 font-bold text-zinc-200">{row.label}</td>
+                                    <td className="py-2.5 px-3 text-center font-mono font-bold text-white">{localVal}</td>
+                                    <td className={`py-2.5 px-3 text-center font-mono font-bold ${row.countForTenant === null ? 'text-red-400' : isDiff ? 'text-amber-400' : 'text-green-400'}`}>
+                                      {row.countForTenant === null ? '—' : row.countForTenant}
+                                    </td>
+                                    <td className="py-2.5 px-3 text-[11px]">
+                                      {!row.ok ? (
+                                        <span className="text-red-400 font-mono break-all">❌ {row.error || 'Erro desconhecido'}</span>
+                                      ) : isDiff ? (
+                                        <span className="text-amber-400">⚠️ Quantidade diferente — clique em "Forçar Envio Limpo"</span>
+                                      ) : (
+                                        <span className="text-green-400 font-bold">✅ 100% Sincronizado</span>
+                                      )}
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             )}

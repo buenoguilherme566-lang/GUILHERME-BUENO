@@ -286,6 +286,33 @@ const upsertBatchResilient = async (
       tableErrors.set(tableName, 'Bloqueado por política RLS (execute o script SQL no Supabase)');
       return;
     }
+    // Se um lote de várias linhas falhou por 1 registro problemático, isola linha a linha para salvar todas as válidas
+    if (Array.isArray(payload) && payload.length > 1) {
+      let firstRowError: string | null = null;
+      let failedCount = 0;
+      for (const singleRow of payload) {
+        const beforeErr = tableErrors.get(tableName);
+        tableErrors.delete(tableName);
+        await upsertBatchResilient(tableName, singleRow, maxAttempts, options);
+        const rowErr = tableErrors.get(tableName);
+        if (rowErr) {
+          failedCount++;
+          if (!firstRowError) {
+            const rowId = singleRow?.id ? ` (id=${singleRow.id})` : '';
+            firstRowError = `${rowErr}${rowId}`;
+          }
+        } else if (beforeErr && !firstRowError) {
+          firstRowError = beforeErr;
+        }
+      }
+      if (firstRowError) {
+        tableErrors.set(tableName, `${failedCount} registro(s) com erro: ${firstRowError}`);
+      } else {
+        tableErrors.delete(tableName);
+      }
+      return;
+    }
+
     const detail = error.code ? `[${error.code}] ${error.message}` : error.message;
     console.error(`[Supabase] Erro persistente na tabela '${tableName}':`, detail);
     tableErrors.set(tableName, detail);
@@ -314,10 +341,18 @@ const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts =
       cleaned.map(row => normalizeRowForTable(tableName, row))
     );
     const chunkSize = (tableName === 'items' || tableName === 'utv_passports' || tableName === 'service_orders') ? 20 : 50;
+    let recordedError: string | null = null;
     for (let i = 0; i < normalized.length; i += chunkSize) {
       const batch = normalized.slice(i, i + chunkSize);
       await upsertBatchResilient(tableName, batch, maxAttempts);
       if (missingTables.has(tableName)) return;
+      const errNow = tableErrors.get(tableName);
+      if (errNow && !recordedError) {
+        recordedError = errNow;
+      }
+    }
+    if (recordedError) {
+      tableErrors.set(tableName, recordedError);
     }
   } else {
     const normalized = normalizeRowForTable(tableName, cleaned);
@@ -1151,21 +1186,6 @@ NOTIFY pgrst, 'reload schema';
     missingTables.clear();
     tableErrors.clear();
 
-    const chunkArray = <T,>(arr: T[], size: number): T[][] => {
-      const chunks: T[][] = [];
-      for (let i = 0; i < arr.length; i += size) {
-        chunks.push(arr.slice(i, i + size));
-      }
-      return chunks;
-    };
-
-    const upsertChunked = async (tableName: string, rows: any[], chunkSize = 25) => {
-      if (!rows || rows.length === 0) return;
-      for (const batch of chunkArray(rows, chunkSize)) {
-        await resilientUpsert(tableName, batch);
-      }
-    };
-
     // 1. Se "Substituição Limpa" estiver ativada, remove dados antigos desta oficina antes de subir o backup
     if (cleanReplace) {
       const tablesToClear = [
@@ -1204,7 +1224,7 @@ NOTIFY pgrst, 'reload schema';
       }
     }
 
-    // 2. Garantir tenantId em todos os registros e enviar em lotes seguros
+    // 2. Garantir tenantId em todos os registros e enviar em ordem segura de dependências (resilientUpsert já faz lotes + isolamento)
     const scopedUsers = (payload.users || []).map(u => ({ ...u, tenantId }));
     const scopedItems = (payload.items || []).map(i => ({ ...i, tenantId }));
     const scopedHistory = (payload.history || []).map(h => ({ ...h, tenantId }));
@@ -1217,14 +1237,14 @@ NOTIFY pgrst, 'reload schema';
     if (payload.tenant) {
       await resilientUpsert('tenants', { ...payload.tenant, id: tenantId });
     }
-    await upsertChunked('users', scopedUsers, 50);
-    await upsertChunked('vehicle_sections', scopedSections, 50);
-    await upsertChunked('labor_templates', scopedTemplates, 50);
-    await upsertChunked('clients', scopedClients, 50);
-    await upsertChunked('items', scopedItems, 20);
-    await upsertChunked('utv_passports', scopedPassports, 15);
-    await upsertChunked('service_orders', scopedOrders, 20);
-    await upsertChunked('history', scopedHistory, 50);
+    await resilientUpsert('users', scopedUsers);
+    await resilientUpsert('vehicle_sections', scopedSections);
+    await resilientUpsert('labor_templates', scopedTemplates);
+    await resilientUpsert('clients', scopedClients);
+    await resilientUpsert('items', scopedItems);
+    await resilientUpsert('utv_passports', scopedPassports);
+    await resilientUpsert('service_orders', scopedOrders);
+    await resilientUpsert('history', scopedHistory);
 
     const errorsObj: Record<string, string> = {};
     tableErrors.forEach((v, k) => { errorsObj[k] = v; });
@@ -1244,8 +1264,137 @@ NOTIFY pgrst, 'reload schema';
       errors: errorsObj,
       missingTables: Array.from(missingTables)
     };
+  },
+
+  // --- DIAGNÓSTICO REAL DE CONEXÃO E CONTAGEM DE TABELAS NO SUPABASE ---
+  async runDiagnostics(tenantId: string): Promise<{
+    configured: boolean;
+    supabaseHost: string;
+    tenantId: string;
+    checkedAt: string;
+    tables: Array<{
+      table: string;
+      label: string;
+      countForTenant: number | null;
+      countTotal: number | null;
+      ok: boolean;
+      error?: string;
+    }>;
+  }> {
+    const rawUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
+    let supabaseHost = 'Não configurado';
+    if (rawUrl) {
+      try {
+        supabaseHost = new URL(rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`).host;
+      } catch {
+        supabaseHost = rawUrl;
+      }
+    }
+
+    const specs = [
+      { table: 'tenants', label: 'Oficinas (tenants)', scoped: false },
+      { table: 'users', label: 'Usuários (users)', scoped: true },
+      { table: 'items', label: 'Peças & Estoque (items)', scoped: true },
+      { table: 'service_orders', label: 'Ordens de Serviço (service_orders)', scoped: true },
+      { table: 'clients', label: 'Clientes (clients)', scoped: true },
+      { table: 'utv_passports', label: 'Passaportes UTV (utv_passports)', scoped: true },
+      { table: 'labor_templates', label: 'Mão de Obra (labor_templates)', scoped: true },
+      { table: 'vehicle_sections', label: 'Setores (vehicle_sections)', scoped: true },
+      { table: 'history', label: 'Movimentações (history)', scoped: true }
+    ];
+
+    if (!supabase) {
+      return {
+        configured: false,
+        supabaseHost,
+        tenantId,
+        checkedAt: new Date().toLocaleString('pt-BR'),
+        tables: specs.map(s => ({
+          table: s.table,
+          label: s.label,
+          countForTenant: null,
+          countTotal: null,
+          ok: false,
+          error: 'Variáveis VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY ausentes neste domínio.'
+        }))
+      };
+    }
+
+    const client = getClient();
+    const results = [];
+
+    for (const spec of specs) {
+      try {
+        const totalRes = await client.from(spec.table).select('id', { count: 'exact', head: true });
+        if (totalRes.error) {
+          const errDetail = totalRes.error.code
+            ? `[${totalRes.error.code}] ${totalRes.error.message}`
+            : totalRes.error.message;
+          results.push({
+            table: spec.table,
+            label: spec.label,
+            countForTenant: null,
+            countTotal: null,
+            ok: false,
+            error: errDetail
+          });
+          continue;
+        }
+
+        let tenantCount: number | null = totalRes.count ?? 0;
+        if (spec.scoped) {
+          const scopedRes = await client
+            .from(spec.table)
+            .select('id', { count: 'exact', head: true })
+            .eq('tenantId', tenantId);
+          if (scopedRes.error) {
+            const errDetail = scopedRes.error.code
+              ? `[${scopedRes.error.code}] ${scopedRes.error.message}`
+              : scopedRes.error.message;
+            results.push({
+              table: spec.table,
+              label: spec.label,
+              countForTenant: null,
+              countTotal: totalRes.count ?? 0,
+              ok: false,
+              error: errDetail
+            });
+            continue;
+          }
+          tenantCount = scopedRes.count ?? 0;
+        }
+
+        const cachedErr = tableErrors.get(spec.table);
+        results.push({
+          table: spec.table,
+          label: spec.label,
+          countForTenant: tenantCount,
+          countTotal: totalRes.count ?? 0,
+          ok: !cachedErr,
+          error: cachedErr
+        });
+      } catch (e: any) {
+        results.push({
+          table: spec.table,
+          label: spec.label,
+          countForTenant: null,
+          countTotal: null,
+          ok: false,
+          error: e?.message || String(e)
+        });
+      }
+    }
+
+    return {
+      configured: true,
+      supabaseHost,
+      tenantId,
+      checkedAt: new Date().toLocaleString('pt-BR'),
+      tables: results
+    };
   }
 };
+
 
 
 
