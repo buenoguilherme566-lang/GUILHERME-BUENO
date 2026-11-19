@@ -960,8 +960,11 @@ const App: React.FC = () => {
     }
     setIsSyncing(true);
     setSyncError(null);
+    // Limpa cache de erros/tabelas ausentes de tentativas anteriores para revalidar 100% no Supabase
+    supabaseService.clearMissingTableCache();
     try {
       // Garantir que todos os itens salvos tenham o tenantId da oficina ativa
+      const scopedUsers = users.map(u => ({ ...u, tenantId: u.tenantId || currentTenant.id }));
       const scopedItems = items.map(i => ({ ...i, tenantId: i.tenantId || currentTenant.id }));
       const scopedHistory = history.map(h => ({ ...h, tenantId: h.tenantId || currentTenant.id }));
       const scopedOrders = serviceOrders.map(o => ({ ...o, tenantId: o.tenantId || currentTenant.id }));
@@ -971,7 +974,8 @@ const App: React.FC = () => {
       const scopedPassports = utvPassports.map(p => ({ ...p, tenantId: p.tenantId || currentTenant.id }));
 
       const tasks = [
-        { name: 'users', label: 'Usuários', action: () => supabaseService.saveUser(users) },
+        { name: 'tenants', label: 'Oficinas', action: () => supabaseService.saveTenant(currentTenant) },
+        { name: 'users', label: 'Usuários', action: () => supabaseService.saveUser(scopedUsers) },
         { name: 'items', label: 'Peças & Estoque', action: () => supabaseService.saveItem(scopedItems) },
         { name: 'history', label: 'Movimentações', action: () => supabaseService.saveTransaction(scopedHistory) },
         { name: 'service_orders', label: 'Ordens de Serviço', action: () => supabaseService.saveServiceOrder(scopedOrders) },
@@ -979,7 +983,6 @@ const App: React.FC = () => {
         { name: 'labor_templates', label: 'Modelos de Mão de Obra', action: () => supabaseService.saveLaborTemplate(scopedTemplates) },
         { name: 'clients', label: 'Clientes', action: () => supabaseService.saveClient(scopedClients) },
         { name: 'utv_passports', label: 'Passaporte UTV', action: () => supabaseService.saveUTVPassport(scopedPassports) },
-        { name: 'tenants', label: 'Oficinas', action: () => supabaseService.saveTenant(currentTenant) },
       ];
 
       await Promise.allSettled(tasks.map(t => t.action()));
@@ -989,20 +992,22 @@ const App: React.FC = () => {
       const pendingKeys = Array.from(new Set([...Object.keys(tableErrors), ...missingTables]));
 
       if (pendingKeys.length > 0) {
-        const errorLabels = pendingKeys.map(k => {
+        const errorItems = pendingKeys.map(k => {
           const found = tasks.find(t => t.name === k);
           const label = found ? found.label : k;
           let reason = tableErrors[k] || 'tabela não encontrada';
           if (reason.includes('invalid input syntax for type integer')) {
             reason = 'coluna quantidade no Supabase é INTEGER; execute o Script SQL para atualizar para NUMERIC e aceitar decimais (3.3)';
           }
-          return `${label} (${reason})`;
-        }).join('\n• ');
+          return { label, reason };
+        });
+        const errorLabels = errorItems.map(e => `${e.label} (${e.reason})`).join('\n• ');
+        const firstSummary = `${errorItems[0].label}: ${errorItems[0].reason}`;
 
-        setSyncError(`Aviso: ${pendingKeys.length} tabela(s) com pendência no Supabase.`);
+        setSyncError(`Pendência (${pendingKeys.length}) — ${firstSummary}`);
         showAlert(
-          "Sincronização Realizada com Sucesso",
-          `Os dados disponíveis foram sincronizados no seu Supabase!\n\nPendência detectada em:\n• ${errorLabels}\n\nPara resolver em 1 clique:\n1. Clique no botão "Script SQL Supabase" na barra de status\n2. Copie o script completo e execute no SQL Editor do seu painel Supabase.`,
+          "Aviso na Sincronização",
+          `Os dados disponíveis foram sincronizados no seu Supabase, mas houve pendência em:\n\n• ${errorLabels}\n\nSe for tabela/coluna ausente ou RLS, clique em "Script SQL Supabase", copie e execute no SQL Editor do Supabase.`,
           "info"
         );
       } else {

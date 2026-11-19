@@ -371,8 +371,11 @@ CREATE INDEX IF NOT EXISTS idx_client_mirror_logs_client ON client_mirror_access
 -- 6. SEGURANÇA, HASHING DE SENHAS E FUNÇÕES RPC (EQUIPE + ESPELHO DO CLIENTE)
 -- ============================================================================
 
--- Impedir leitura direta da coluna password da tabela users por clientes anônimos
+-- Impedir leitura direta da coluna password da tabela users por clientes anônimos mantendo permissões de upsert
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
 REVOKE SELECT (password) ON users FROM anon, authenticated;
+GRANT SELECT (id, username, name, role, email, "avatarUrl", "tenantId"), INSERT, UPDATE, DELETE ON users TO anon, authenticated;
 
 -- Gatilho para hashing automático de senhas de funcionários (bcrypt)
 CREATE OR REPLACE FUNCTION hash_user_password()
@@ -383,7 +386,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 DROP TRIGGER IF EXISTS trg_hash_password ON users;
 CREATE TRIGGER trg_hash_password

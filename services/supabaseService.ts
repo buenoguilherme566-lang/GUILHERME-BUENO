@@ -40,26 +40,107 @@ export const isTableMissingError = (error: any): boolean => {
 export const isRlsError = (error: any): boolean => {
   if (!error) return false;
   const msg = String(error.message || '').toLowerCase();
-  const code = String(error.code || '');
-  return code === '42501' || msg.includes('row-level security') || msg.includes('violates');
+  return msg.includes('row-level security');
 };
 
-// Helper para upsert resiliente que detecta colunas ausentes, tabelas não criadas ou restrições RLS
-const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts = 6): Promise<void> => {
-  let payload = cleanPayload(rawPayload);
+// Normaliza campos obrigatórios (NOT NULL no Postgres) para impedir erro 23502 com dados legados
+const normalizeRowForTable = (tableName: string, row: any): any => {
+  if (!row || typeof row !== 'object') return row;
+  const nowIso = new Date().toISOString();
+  const copy = { ...row };
 
-  // Se for array vazio, não há nada a persistir no Supabase
-  if (Array.isArray(payload) && payload.length === 0) {
-    tableErrors.delete(tableName);
-    return;
+  if (tableName === 'tenants') {
+    if (!copy.name) copy.name = 'HPS Control Matriz';
+    if (!copy.createdAt) copy.createdAt = nowIso;
+  } else if (tableName === 'users') {
+    if (!copy.username) copy.username = copy.id || `user_${Math.random().toString(36).slice(2, 7)}`;
+    if (!copy.name) copy.name = copy.username;
+    if (!copy.role) copy.role = 'MECHANIC';
+    if (copy.password === '' || copy.password === null) delete copy.password;
+  } else if (tableName === 'items') {
+    if (copy.partNumber === undefined || copy.partNumber === null) copy.partNumber = 'S/N';
+    if (!copy.name) copy.name = 'Peça sem nome';
+    if (!copy.category) copy.category = 'Outros';
+    if (copy.boxNumber === undefined || copy.boxNumber === null) copy.boxNumber = 'S/N';
+    if (copy.quantity === undefined || copy.quantity === null || Number.isNaN(Number(copy.quantity))) copy.quantity = 0;
+    if (copy.minQuantity === undefined || copy.minQuantity === null || Number.isNaN(Number(copy.minQuantity))) copy.minQuantity = 0;
+    if (copy.value === undefined || copy.value === null || Number.isNaN(Number(copy.value))) copy.value = 0;
+  } else if (tableName === 'history') {
+    if (!copy.itemId) copy.itemId = 'unknown_item';
+    if (!copy.itemName) copy.itemName = 'Item';
+    if (!copy.userName) copy.userName = 'Sistema';
+    if (!copy.type) copy.type = 'OUT';
+    if (!copy.date) copy.date = nowIso;
+    if (copy.quantity === undefined || copy.quantity === null || Number.isNaN(Number(copy.quantity))) copy.quantity = 0;
+  } else if (tableName === 'service_orders') {
+    if (!copy.osNumber) copy.osNumber = copy.id || 'OS-000';
+    if (!copy.customerName) copy.customerName = 'Cliente';
+    if (!copy.vehicleModel) copy.vehicleModel = 'UTV';
+    if (!copy.status) copy.status = 'OPEN';
+    if (!copy.createdAt) copy.createdAt = nowIso;
+    if (!copy.updatedAt) copy.updatedAt = copy.createdAt || nowIso;
+    if (!Array.isArray(copy.parts)) copy.parts = [];
+    if (!Array.isArray(copy.laborItems)) copy.laborItems = [];
+  } else if (tableName === 'vehicle_sections') {
+    if (!copy.name) copy.name = 'Setor';
+    if (!Array.isArray(copy.components)) copy.components = [];
+  } else if (tableName === 'labor_templates') {
+    if (!copy.description) copy.description = 'Serviço';
+  } else if (tableName === 'clients') {
+    if (!copy.name) copy.name = 'Cliente';
+    if (!copy.createdAt) copy.createdAt = nowIso;
+    if (!Array.isArray(copy.vehicles)) copy.vehicles = [];
+  } else if (tableName === 'utv_passports') {
+    if (!copy.qrCode) copy.qrCode = `UTV-${copy.id || Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+    if (!copy.vehicleModel) copy.vehicleModel = 'Can-Am UTV';
+    if (!copy.customerName) copy.customerName = 'Cliente';
+    if (!copy.createdAt) copy.createdAt = nowIso;
+    if (!copy.updatedAt) copy.updatedAt = copy.createdAt || nowIso;
   }
 
-  if (missingTables.has(tableName)) {
-    console.warn(`[Supabase] Tabela '${tableName}' ausente no schema cache. Operação preservada localmente.`);
-    return;
+  return copy;
+};
+
+// Remove duplicatas no mesmo lote para evitar erro 21000 / 23505 no ON CONFLICT DO UPDATE
+const deduplicateRows = (tableName: string, rows: any[]): any[] => {
+  const byId = new Map<string, any>();
+  for (const r of rows) {
+    if (r && r.id !== undefined) {
+      byId.set(String(r.id), r);
+    }
+  }
+  let result = Array.from(byId.values());
+
+  if (tableName === 'users') {
+    const byUsername = new Map<string, any>();
+    for (const u of result) {
+      const key = String(u.username || u.id).trim().toLowerCase();
+      byUsername.set(key, u);
+    }
+    result = Array.from(byUsername.values());
+  } else if (tableName === 'utv_passports') {
+    const byQr = new Map<string, any>();
+    for (const p of result) {
+      const key = String(p.qrCode || p.id).trim();
+      byQr.set(key, p);
+    }
+    result = Array.from(byQr.values());
   }
 
-  let { error } = await getClient().from(tableName).upsert(payload);
+  return result;
+};
+
+// Executa upsert de um único lote resiliente
+const upsertBatchResilient = async (
+  tableName: string,
+  batchPayload: any,
+  maxAttempts = 6,
+  upsertOptions?: { onConflict?: string }
+): Promise<void> => {
+  let payload = batchPayload;
+  let options = upsertOptions;
+
+  let { error } = await getClient().from(tableName).upsert(payload, options);
   let attempts = 0;
 
   if (isTableMissingError(error)) {
@@ -87,7 +168,9 @@ const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts =
     }
 
     attempts++;
-    const match = error.message?.match(/Could not find the '([^']+)' column/i);
+    const errMsg = String(error.message || '');
+    const errCode = String(error.code || '');
+    const match = errMsg.match(/Could not find the '([^']+)' column/i);
     const colName = match ? match[1] : null;
 
     if (colName) {
@@ -95,17 +178,51 @@ const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts =
       payload = Array.isArray(payload)
         ? payload.map((row: any) => { const copy = { ...row }; delete copy[colName]; return copy; })
         : (() => { const copy = { ...payload }; delete copy[colName]; return copy; })();
-      const retry = await getClient().from(tableName).upsert(payload);
+      const retry = await getClient().from(tableName).upsert(payload, options);
       error = retry.error;
-    } else if (error.message?.includes('invalid input syntax for type integer') || error.code === '22P02') {
-      // Postgres rejeitou número decimal (ex: 3.3) porque a coluna foi criada como INTEGER no Supabase!
-      // Como fallback de compatibilidade temporária para não travar a sincronização enquanto o usuário não roda o SQL:
-      console.warn(`[Supabase] Aviso: Coluna do tipo INTEGER no Supabase rejeitou valor decimal em '${tableName}'. Aplicando arredondamento para sincronizar e aguardando execução do script SQL...`);
+    } else if (errCode === '23505' && tableName === 'users' && options?.onConflict !== 'username') {
+      // Conflito de username duplicado com ID diferente no Supabase -> atualiza pelo username
+      console.warn(`[Supabase] Conflito de username em 'users'. Reenviando usando onConflict='username'...`);
+      options = { onConflict: 'username' };
+      const retry = await getClient().from(tableName).upsert(payload, options);
+      error = retry.error;
+    } else if (errCode === '23505' && tableName === 'utv_passports' && options?.onConflict !== 'qrCode') {
+      // Conflito de qrCode duplicado com ID diferente no Supabase -> atualiza pelo qrCode
+      console.warn(`[Supabase] Conflito de qrCode em 'utv_passports'. Reenviando usando onConflict='qrCode'...`);
+      options = { onConflict: 'qrCode' };
+      const retry = await getClient().from(tableName).upsert(payload, options);
+      error = retry.error;
+    } else if (errCode === '42501' && tableName === 'users') {
+      // Permissão restrita na coluna password (REVOKE SELECT (password)) durante upsert -> reenvia sem a coluna password
+      const hadPassword = Array.isArray(payload)
+        ? payload.some((r: any) => r && 'password' in r)
+        : (payload && 'password' in payload);
+      if (hadPassword) {
+        console.warn(`[Supabase] Restrição na coluna password de 'users' durante sincronização. Reenviando perfil sem alterar hash de senha...`);
+        payload = Array.isArray(payload)
+          ? payload.map(({ password, ...rest }: any) => rest)
+          : (({ password, ...rest }: any) => rest)(payload);
+        const retry = await getClient().from(tableName).upsert(payload, options);
+        error = retry.error;
+      } else {
+        // Ainda 42501 sem password -> tenta atualizar linha a linha ignorando password
+        const rows = Array.isArray(payload) ? payload : [payload];
+        let lastRowErr: any = null;
+        for (const r of rows) {
+          const { id, password: _pw, ...fields } = r;
+          const upd = await getClient().from('users').update(fields).eq('id', id);
+          if (upd.error) lastRowErr = upd.error;
+        }
+        error = lastRowErr;
+        break;
+      }
+    } else if (errMsg.includes('invalid input syntax for type integer') || errCode === '22P02') {
+      console.warn(`[Supabase] Aviso: Coluna do tipo INTEGER no Supabase rejeitou valor decimal em '${tableName}'. Aplicando arredondamento temporário...`);
       const roundNumbers = (obj: any): any => {
         if (Array.isArray(obj)) return obj.map(roundNumbers);
         if (obj !== null && typeof obj === 'object') {
           const res: any = { ...obj };
-          ['quantity', 'minQuantity', 'value', 'unitValue', 'hours', 'minutes', 'defaultHours', 'defaultValuePerHour', 'fixedValue'].forEach(key => {
+          ['quantity', 'minQuantity', 'value', 'unitValue', 'hours', 'minutes', 'defaultHours', 'defaultValuePerHour', 'fixedValue', 'currentKm'].forEach(key => {
             if (typeof res[key] === 'number') {
               res[key] = Math.round(res[key]);
             }
@@ -115,13 +232,13 @@ const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts =
         return obj;
       };
       payload = roundNumbers(payload);
-      const retry = await getClient().from(tableName).upsert(payload);
+      const retry = await getClient().from(tableName).upsert(payload, options);
       error = retry.error;
       if (!error) {
         tableErrors.delete(tableName);
         break;
       }
-    } else if (error.code === 'PGRST204' || error.message?.includes('schema cache')) {
+    } else if (errCode === 'PGRST204' || errMsg.includes('schema cache')) {
       if (tableName === 'history') {
         payload = Array.isArray(payload)
           ? payload.map(({ notes, destination, osNumber, unitValue, userId, mechanicId, tenantId, ...rest }: any) => rest)
@@ -151,7 +268,7 @@ const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts =
           ? payload.map(({ phone, email, username, password, isAccessActive, tenantId, ...rest }: any) => rest)
           : (({ phone, email, username, password, isAccessActive, tenantId, ...rest }: any) => rest)(payload);
       }
-      const retry = await getClient().from(tableName).upsert(payload);
+      const retry = await getClient().from(tableName).upsert(payload, options);
       error = retry.error;
       break;
     } else {
@@ -169,10 +286,42 @@ const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts =
       tableErrors.set(tableName, 'Bloqueado por política RLS (execute o script SQL no Supabase)');
       return;
     }
-    console.error(`[Supabase] Erro persistente na tabela '${tableName}':`, error.message);
-    tableErrors.set(tableName, error.message);
-  } else {
+    const detail = error.code ? `[${error.code}] ${error.message}` : error.message;
+    console.error(`[Supabase] Erro persistente na tabela '${tableName}':`, detail);
+    tableErrors.set(tableName, detail);
+  }
+};
+
+// Helper para upsert resiliente com normalização, deduplicação e envio em lotes seguros
+const resilientUpsert = async (tableName: string, rawPayload: any, maxAttempts = 6): Promise<void> => {
+  const cleaned = cleanPayload(rawPayload);
+
+  if (Array.isArray(cleaned) && cleaned.length === 0) {
     tableErrors.delete(tableName);
+    return;
+  }
+
+  if (missingTables.has(tableName)) {
+    console.warn(`[Supabase] Tabela '${tableName}' ausente no schema cache. Operação preservada localmente.`);
+    return;
+  }
+
+  tableErrors.delete(tableName);
+
+  if (Array.isArray(cleaned)) {
+    const normalized = deduplicateRows(
+      tableName,
+      cleaned.map(row => normalizeRowForTable(tableName, row))
+    );
+    const chunkSize = (tableName === 'items' || tableName === 'utv_passports' || tableName === 'service_orders') ? 20 : 50;
+    for (let i = 0; i < normalized.length; i += chunkSize) {
+      const batch = normalized.slice(i, i + chunkSize);
+      await upsertBatchResilient(tableName, batch, maxAttempts);
+      if (missingTables.has(tableName)) return;
+    }
+  } else {
+    const normalized = normalizeRowForTable(tableName, cleaned);
+    await upsertBatchResilient(tableName, normalized, maxAttempts);
   }
 };
 
@@ -578,7 +727,10 @@ CREATE INDEX IF NOT EXISTS idx_utv_passports_tenant ON utv_passports("tenantId")
 CREATE INDEX IF NOT EXISTS idx_client_mirror_logs_client ON client_mirror_access_logs("clientId");
 
 -- 6. Segurança de Senha + RPCs de Autenticação (Equipe e Espelho do Cliente)
+GRANT USAGE ON SCHEMA public TO anon, authenticated;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
 REVOKE SELECT (password) ON users FROM anon, authenticated;
+GRANT SELECT (id, username, name, role, email, "avatarUrl", "tenantId"), INSERT, UPDATE, DELETE ON users TO anon, authenticated;
 
 CREATE OR REPLACE FUNCTION hash_user_password()
 RETURNS TRIGGER AS $$
@@ -588,7 +740,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
 DROP TRIGGER IF EXISTS trg_hash_password ON users;
 CREATE TRIGGER trg_hash_password
