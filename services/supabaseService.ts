@@ -972,7 +972,128 @@ NOTIFY pgrst, 'reload schema';
     if (missingTables.has('utv_passports')) return;
     const { error } = await getClient().from('utv_passports').delete().eq('id', id);
     if (error && !isTableMissingError(error)) throw error;
+  },
+
+  // --- MIGRAÇÃO COMPLETA / BACKUP RESTORE ---
+  async importFullTenantBackup(
+    tenantId: string,
+    payload: {
+      tenant?: Tenant;
+      users?: User[];
+      items?: InventoryItem[];
+      history?: Transaction[];
+      serviceOrders?: ServiceOrder[];
+      vehicleSections?: VehicleSection[];
+      laborTemplates?: LaborTemplate[];
+      clients?: Client[];
+      utvPassports?: UTVPassport[];
+    },
+    cleanReplace = true
+  ): Promise<{
+    success: boolean;
+    counts: Record<string, number>;
+    errors: Record<string, string>;
+    missingTables: string[];
+  }> {
+    const client = getClient();
+    missingTables.clear();
+    tableErrors.clear();
+
+    const chunkArray = <T,>(arr: T[], size: number): T[][] => {
+      const chunks: T[][] = [];
+      for (let i = 0; i < arr.length; i += size) {
+        chunks.push(arr.slice(i, i + size));
+      }
+      return chunks;
+    };
+
+    const upsertChunked = async (tableName: string, rows: any[], chunkSize = 25) => {
+      if (!rows || rows.length === 0) return;
+      for (const batch of chunkArray(rows, chunkSize)) {
+        await resilientUpsert(tableName, batch);
+      }
+    };
+
+    // 1. Se "Substituição Limpa" estiver ativada, remove dados antigos desta oficina antes de subir o backup
+    if (cleanReplace) {
+      const tablesToClear = [
+        'history',
+        'service_orders',
+        'utv_passports',
+        'items',
+        'labor_templates',
+        'vehicle_sections',
+        'clients'
+      ];
+
+      for (const tbl of tablesToClear) {
+        try {
+          const { error } = await client.from(tbl).delete().eq('tenantId', tenantId);
+          if (error) {
+            if (isTableMissingError(error)) {
+              missingTables.add(tbl);
+              tableErrors.set(tbl, 'Tabela não encontrada no Supabase');
+              continue;
+            }
+            if (isRlsError(error)) {
+              tableErrors.set(tbl, 'Bloqueado por política RLS (execute o script SQL no Supabase)');
+              continue;
+            }
+            console.warn(`[Supabase] Aviso ao limpar tabela '${tbl}':`, error.message);
+          }
+
+          // Para a matriz padrão, remove também registros legados sem tenantId (evita reaparecerem no F5)
+          if (tenantId === 'tenant_matriz_hps') {
+            await client.from(tbl).delete().is('tenantId', null);
+          }
+        } catch (e: any) {
+          console.warn(`[Supabase] Exceção ao limpar tabela '${tbl}':`, e?.message || e);
+        }
+      }
+    }
+
+    // 2. Garantir tenantId em todos os registros e enviar em lotes seguros
+    const scopedUsers = (payload.users || []).map(u => ({ ...u, tenantId }));
+    const scopedItems = (payload.items || []).map(i => ({ ...i, tenantId }));
+    const scopedHistory = (payload.history || []).map(h => ({ ...h, tenantId }));
+    const scopedOrders = (payload.serviceOrders || []).map(o => ({ ...o, tenantId }));
+    const scopedSections = (payload.vehicleSections || []).map(s => ({ ...s, tenantId }));
+    const scopedTemplates = (payload.laborTemplates || []).map(l => ({ ...l, tenantId }));
+    const scopedClients = (payload.clients || []).map(c => ({ ...c, tenantId }));
+    const scopedPassports = (payload.utvPassports || []).map(p => ({ ...p, tenantId }));
+
+    if (payload.tenant) {
+      await resilientUpsert('tenants', { ...payload.tenant, id: tenantId });
+    }
+    await upsertChunked('users', scopedUsers, 50);
+    await upsertChunked('vehicle_sections', scopedSections, 50);
+    await upsertChunked('labor_templates', scopedTemplates, 50);
+    await upsertChunked('clients', scopedClients, 50);
+    await upsertChunked('items', scopedItems, 20);
+    await upsertChunked('utv_passports', scopedPassports, 15);
+    await upsertChunked('service_orders', scopedOrders, 20);
+    await upsertChunked('history', scopedHistory, 50);
+
+    const errorsObj: Record<string, string> = {};
+    tableErrors.forEach((v, k) => { errorsObj[k] = v; });
+
+    return {
+      success: Object.keys(errorsObj).length === 0 && missingTables.size === 0,
+      counts: {
+        items: scopedItems.length,
+        serviceOrders: scopedOrders.length,
+        clients: scopedClients.length,
+        utvPassports: scopedPassports.length,
+        laborTemplates: scopedTemplates.length,
+        vehicleSections: scopedSections.length,
+        history: scopedHistory.length,
+        users: scopedUsers.length
+      },
+      errors: errorsObj,
+      missingTables: Array.from(missingTables)
+    };
   }
 };
+
 
 

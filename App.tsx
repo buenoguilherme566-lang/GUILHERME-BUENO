@@ -313,7 +313,16 @@ const App: React.FC = () => {
 
   // --- STATE FOR DYNAMIC TECHNICAL GROUPS & CONFIG ---
   const [categories, setCategories] = useState<string[]>([]);
-  const [configSubTab, setConfigSubTab] = useState<'company' | 'sectors' | 'labor' | 'groups'>('company');
+  const [configSubTab, setConfigSubTab] = useState<'company' | 'sectors' | 'labor' | 'groups' | 'backup'>('company');
+  const [backupCleanReplace, setBackupCleanReplace] = useState<boolean>(true);
+  const [isMigratingBackup, setIsMigratingBackup] = useState<boolean>(false);
+  const [backupLastReport, setBackupLastReport] = useState<{
+    timestamp: string;
+    mode: 'export' | 'import';
+    syncedToSupabase: boolean;
+    cleanReplace: boolean;
+    summary: string;
+  } | null>(null);
   const [editingCategory, setEditingCategory] = useState<{ original: string; current: string } | null>(null);
   const [newCategoryName, setNewCategoryName] = useState("");
   const [labelSearchTerm, setLabelSearchTerm] = useState("");
@@ -1007,6 +1016,242 @@ const App: React.FC = () => {
     } finally {
       setIsSyncing(false);
     }
+  };
+
+  // --- EXPORTAR BACKUP COMPLETO (.JSON) DA OFICINA ATIVA ---
+  const handleExportFullBackupJson = () => {
+    try {
+      const snapshot = {
+        app: 'HPS_CONTROL',
+        version: 'V12',
+        exportedAt: new Date().toISOString(),
+        sourceHost: typeof window !== 'undefined' ? window.location.host : 'local',
+        tenant: currentTenant,
+        categories,
+        data: {
+          users,
+          items,
+          serviceOrders,
+          history,
+          clients,
+          utvPassports,
+          laborTemplates,
+          vehicleSections
+        }
+      };
+
+      const jsonStr = JSON.stringify(snapshot, null, 2);
+      const blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const now = new Date();
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const fileName = `hps-control-backup-${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}h${pad(now.getMinutes())}.json`;
+
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      const summary = `${items.length} peças, ${serviceOrders.length} O.S., ${clients.length} clientes, ${utvPassports.length} passaportes UTV, ${laborTemplates.length} M.O., ${vehicleSections.length} setores e ${history.length} movimentações.`;
+      setBackupLastReport({
+        timestamp: new Date().toLocaleString('pt-BR'),
+        mode: 'export',
+        syncedToSupabase: false,
+        cleanReplace: false,
+        summary
+      });
+
+      showAlert(
+        'Backup Exportado com Sucesso!',
+        `Arquivo "${fileName}" baixado!\n\nConteúdo salvo:\n• ${items.length} peças no estoque\n• ${serviceOrders.length} Ordens de Serviço\n• ${clients.length} clientes\n• ${utvPassports.length} passaportes UTV\n• ${laborTemplates.length} modelos de Mão de Obra\n• ${vehicleSections.length} setores do veículo\n• ${history.length} registros de movimentação\n\nAgora abra o seu sistema publicado no Netlify, acesse Configurações Técnicas → Backup & Migração e importe este arquivo.`,
+        'success'
+      );
+    } catch (e: any) {
+      console.error('Erro ao exportar backup JSON:', e);
+      showAlert('Erro na Exportação', e?.message || 'Não foi possível gerar o arquivo de backup.', 'error');
+    }
+  };
+
+  // --- IMPORTAR BACKUP COMPLETO (.JSON) E MIGRAR PARA O SUPABASE ---
+  const handleImportFullBackupJson = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result || ''));
+        const dataBlock = parsed?.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+
+        const importedItems: InventoryItem[] = Array.isArray(dataBlock.items) ? dataBlock.items : [];
+        const importedOrders: ServiceOrder[] = Array.isArray(dataBlock.serviceOrders) ? dataBlock.serviceOrders : [];
+        const importedHistory: Transaction[] = Array.isArray(dataBlock.history) ? dataBlock.history : [];
+        const importedClients: Client[] = Array.isArray(dataBlock.clients) ? dataBlock.clients : [];
+        const importedPassports: UTVPassport[] = Array.isArray(dataBlock.utvPassports) ? dataBlock.utvPassports : [];
+        const importedLabor: LaborTemplate[] = Array.isArray(dataBlock.laborTemplates) ? dataBlock.laborTemplates : [];
+        const importedSections: VehicleSection[] = Array.isArray(dataBlock.vehicleSections) ? dataBlock.vehicleSections : [];
+        const importedUsers: User[] = Array.isArray(dataBlock.users) ? dataBlock.users : [];
+        const importedCategories: string[] = Array.isArray(parsed?.categories) ? parsed.categories : [];
+        const importedTenantRaw: Partial<Tenant> | null = parsed?.tenant && typeof parsed.tenant === 'object' ? parsed.tenant : null;
+
+        const hasRecognizedContent =
+          Array.isArray(dataBlock.items) ||
+          Array.isArray(dataBlock.serviceOrders) ||
+          Array.isArray(dataBlock.clients) ||
+          Array.isArray(dataBlock.laborTemplates);
+
+        if (!hasRecognizedContent) {
+          showAlert(
+            'Arquivo Inválido',
+            'Este arquivo JSON não parece ser um backup gerado pelo HPS Control. Use o botão "Exportar Backup Completo (.json)" na Área de Teste.',
+            'error'
+          );
+          return;
+        }
+
+        const isCloudOnline = supabaseService.isAvailable();
+        const modeText = isCloudOnline
+          ? (backupCleanReplace
+              ? 'SUBSTITUIÇÃO LIMPA (1:1): os dados antigos desta oficina no Supabase serão apagados e substituídos exatamente por este backup.'
+              : 'MESCLAGEM: os registros do backup serão enviados e mesclados ao Supabase sem apagar itens antigos.')
+          : 'MODO LOCAL: os dados serão aplicados neste navegador (Supabase não detectado neste domínio).';
+
+        showConfirm(
+          'Confirmar Migração de Backup',
+          `Arquivo: ${file.name}\n\nSerão importados:\n• ${importedItems.length} peças no estoque\n• ${importedOrders.length} Ordens de Serviço\n• ${importedClients.length} clientes\n• ${importedPassports.length} passaportes UTV\n• ${importedLabor.length} modelos de Mão de Obra\n• ${importedSections.length} setores\n• ${importedHistory.length} movimentações\n\nModo selecionado:\n${modeText}\n\nDeseja continuar agora?`,
+          async () => {
+            setIsMigratingBackup(true);
+            setSyncError(null);
+            try {
+              const targetTenantId = currentTenant.id;
+              const mergedTenant: Tenant = importedTenantRaw
+                ? {
+                    ...currentTenant,
+                    ...importedTenantRaw,
+                    id: targetTenantId
+                  }
+                : currentTenant;
+
+              const scopedItems = importedItems.map(i => ({ ...i, tenantId: targetTenantId }));
+              const scopedOrders = importedOrders.map(o => ({ ...o, tenantId: targetTenantId }));
+              const scopedHistory = importedHistory.map(h => ({ ...h, tenantId: targetTenantId }));
+              const scopedClients = importedClients.map(c => ({ ...c, tenantId: targetTenantId }));
+              const scopedPassports = importedPassports.map(p => ({ ...p, tenantId: targetTenantId }));
+              const scopedLabor = importedLabor.map(l => ({ ...l, tenantId: targetTenantId }));
+              const scopedSections = importedSections.map(s => ({ ...s, tenantId: targetTenantId }));
+              const scopedUsers = importedUsers.length > 0
+                ? importedUsers.map(u => ({ ...u, tenantId: targetTenantId }))
+                : users;
+
+              // 1. Atualizar estado React
+              setCurrentTenant(mergedTenant);
+              setTenants(prev => prev.map(t => (t.id === targetTenantId ? mergedTenant : t)));
+              setItems(scopedItems);
+              setServiceOrders(scopedOrders);
+              setHistory(scopedHistory);
+              setClients(scopedClients);
+              setUtvPassports(scopedPassports);
+              setLaborTemplates(scopedLabor);
+              setVehicleSections(scopedSections);
+              setUsers(scopedUsers);
+              if (importedCategories.length > 0) {
+                setCategories(importedCategories);
+              }
+
+              // 2. Persistir imediatamente no armazenamento local (IndexedDB + localStorage)
+              const localPayload = {
+                users: scopedUsers,
+                items: scopedItems,
+                history: scopedHistory,
+                serviceOrders: scopedOrders,
+                vehicleSections: scopedSections,
+                laborTemplates: scopedLabor,
+                clients: scopedClients,
+                utvPassports: scopedPassports
+              };
+              await idbSet(`${DB_KEY}_${targetTenantId}`, localPayload);
+              safeSetItem(`${DB_KEY}_${targetTenantId}`, JSON.stringify(localPayload));
+              if (importedCategories.length > 0) {
+                safeSetItem('HPS_CATEGORIES_V12', JSON.stringify(importedCategories));
+              }
+
+              const summary = `${scopedItems.length} peças, ${scopedOrders.length} O.S., ${scopedClients.length} clientes, ${scopedPassports.length} passaportes UTV, ${scopedLabor.length} M.O., ${scopedSections.length} setores e ${scopedHistory.length} movimentações.`;
+
+              // 3. Se Supabase estiver online, migrar tudo para a nuvem
+              if (supabaseService.isAvailable()) {
+                const result = await supabaseService.importFullTenantBackup(
+                  targetTenantId,
+                  {
+                    tenant: mergedTenant,
+                    users: scopedUsers,
+                    items: scopedItems,
+                    history: scopedHistory,
+                    serviceOrders: scopedOrders,
+                    vehicleSections: scopedSections,
+                    laborTemplates: scopedLabor,
+                    clients: scopedClients,
+                    utvPassports: scopedPassports
+                  },
+                  backupCleanReplace
+                );
+
+                setBackupLastReport({
+                  timestamp: new Date().toLocaleString('pt-BR'),
+                  mode: 'import',
+                  syncedToSupabase: result.success,
+                  cleanReplace: backupCleanReplace,
+                  summary
+                });
+
+                const errKeys = Object.keys(result.errors);
+                if (result.success) {
+                  setSyncError(null);
+                  showAlert(
+                    'Migração Concluída no Supabase!',
+                    `Todos os dados foram migrados com sucesso para a oficina "${mergedTenant.name}"!\n\nResumo gravado na nuvem:\n• ${scopedItems.length} peças\n• ${scopedOrders.length} Ordens de Serviço\n• ${scopedClients.length} clientes\n• ${scopedPassports.length} passaportes UTV\n• ${scopedLabor.length} modelos de M.O.\n• ${scopedSections.length} setores\n• ${scopedHistory.length} movimentações\n\nVocê já pode apertar F5 para confirmar que tudo está sincronizado.`,
+                    'success'
+                  );
+                } else {
+                  const errDetail = errKeys.map(k => `• ${k}: ${result.errors[k]}`).join('\n');
+                  setSyncError(`Migração concluída com ${errKeys.length} aviso(s) no Supabase.`);
+                  showAlert(
+                    'Migração Aplicada com Avisos',
+                    `Os dados foram restaurados localmente, mas algumas tabelas retornaram aviso no Supabase:\n${errDetail}\n\nVerifique se o Script SQL atualizado foi executado no SQL Editor do Supabase.`,
+                    'info'
+                  );
+                }
+              } else {
+                setBackupLastReport({
+                  timestamp: new Date().toLocaleString('pt-BR'),
+                  mode: 'import',
+                  syncedToSupabase: false,
+                  cleanReplace: backupCleanReplace,
+                  summary
+                });
+                showAlert(
+                  'Backup Restaurado Localmente!',
+                  `Dados restaurados neste navegador (${summary}).\n\nNota: o Supabase não está conectado neste endereço. Para migrar para a nuvem, importe este arquivo dentro do seu site publicado no Netlify.`,
+                  'success'
+                );
+              }
+            } catch (err: any) {
+              console.error('Erro ao migrar backup:', err);
+              showAlert('Erro na Migração', err?.message || 'Falha ao importar os dados do backup.', 'error');
+            } finally {
+              setIsMigratingBackup(false);
+            }
+          }
+        );
+      } catch (parseErr: any) {
+        console.error('Erro ao ler JSON de backup:', parseErr);
+        showAlert('Erro ao Ler Arquivo', 'Não foi possível ler o arquivo selecionado. Verifique se ele é um arquivo .json válido.', 'error');
+      }
+    };
+    reader.readAsText(file);
   };
 
   // --- AUTH STATE ---
@@ -7077,7 +7322,7 @@ const App: React.FC = () => {
             </div>
 
             {/* Sub-abas de Configuração */}
-            <div className="flex flex-wrap gap-2 p-1 bg-zinc-900/50 border border-zinc-800/80 rounded-2xl max-w-2xl">
+            <div className="flex flex-wrap gap-2 p-1 bg-zinc-900/50 border border-zinc-800/80 rounded-2xl max-w-4xl">
                <button 
                  onClick={() => setConfigSubTab('company')} 
                  className={`flex-1 min-w-[130px] py-4 text-[10px] font-black uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-1.5 ${configSubTab === 'company' ? 'bg-green-500 text-black shadow-glow' : 'text-zinc-500 hover:text-white hover:bg-zinc-900/40'}`}
@@ -7101,6 +7346,12 @@ const App: React.FC = () => {
                  className={`flex-1 min-w-[110px] py-4 text-[10px] font-black uppercase tracking-wider rounded-xl transition-all ${configSubTab === 'groups' ? 'bg-green-500 text-black shadow-glow' : 'text-zinc-500 hover:text-white hover:bg-zinc-900/40'}`}
                >
                  Grupos Técnicos
+               </button>
+               <button 
+                 onClick={() => setConfigSubTab('backup')} 
+                 className={`flex-1 min-w-[140px] py-4 text-[10px] font-black uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-1.5 ${configSubTab === 'backup' ? 'bg-green-500 text-black shadow-glow' : 'text-zinc-500 hover:text-white hover:bg-zinc-900/40'}`}
+               >
+                 <Database size={13} /> Backup &amp; Migração
                </button>
             </div>
 
@@ -8462,6 +8713,167 @@ const App: React.FC = () => {
                       </div>
                     ))}
                  </div>
+              </div>
+            )}
+
+            {configSubTab === 'backup' && (
+              <div className="space-y-8 animate-in fade-in">
+                {/* Painel Resumo dos Dados Atuais neste Navegador */}
+                <div className="bg-zinc-900 border border-zinc-800 p-6 sm:p-10 rounded-[2.5rem] space-y-6 shadow-2xl">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800 pb-5">
+                    <div>
+                      <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-[9px] font-black uppercase tracking-wider border ${supabaseService.isAvailable() ? 'bg-green-500/10 text-green-400 border-green-500/30' : 'bg-amber-500/10 text-amber-400 border-amber-500/30'}`}>
+                        {supabaseService.isAvailable() ? <Cloud size={12} /> : <CloudOff size={12} />}
+                        {supabaseService.isAvailable() ? 'Conectado ao Supabase (Nuvem)' : 'Ambiente Local / Área de Teste'}
+                      </span>
+                      <h4 className="text-xl font-black uppercase italic tracking-tight text-white mt-2">
+                        Migração 1:1 &amp; Backup Completo
+                      </h4>
+                      <p className="text-[11px] text-zinc-400 mt-1">
+                        Transfira todos os dados da Área de Teste diretamente para o seu sistema publicado no Netlify + Supabase sem perder nada.
+                      </p>
+                    </div>
+                    <Database size={28} className="text-green-500 shrink-0 hidden sm:block" />
+                  </div>
+
+                  {/* Contadores do que existe carregado agora */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3">
+                    {[
+                      { label: 'Peças', count: items.length, icon: Package },
+                      { label: 'O.S.', count: serviceOrders.length, icon: FileText },
+                      { label: 'Clientes', count: clients.length, icon: Users },
+                      { label: 'Passaportes', count: utvPassports.length, icon: ShieldCheck },
+                      { label: 'M.O.', count: laborTemplates.length, icon: Wrench },
+                      { label: 'Setores', count: vehicleSections.length, icon: Layers },
+                      { label: 'Histórico', count: history.length, icon: History },
+                    ].map(stat => (
+                      <div key={stat.label} className="bg-black border border-zinc-800/90 rounded-2xl p-3.5 flex flex-col items-center text-center gap-1">
+                        <stat.icon size={14} className="text-green-500" />
+                        <span className="text-xl font-black text-white leading-none">{stat.count}</span>
+                        <span className="text-[9px] font-black uppercase tracking-wider text-zinc-500">{stat.label}</span>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Duas Colunas: Passo 1 Exportar | Passo 2 Importar */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 pt-2">
+                    {/* PASSO 1: EXPORTAR */}
+                    <div className="bg-black border border-zinc-800 rounded-[2rem] p-6 sm:p-7 flex flex-col justify-between gap-6">
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="px-3 py-1 bg-zinc-900 border border-zinc-700 text-green-400 text-[9px] font-black uppercase tracking-widest rounded-lg">
+                            Passo 1 • Na Área de Teste
+                          </span>
+                          <Download size={18} className="text-green-500" />
+                        </div>
+                        <h5 className="text-base font-black uppercase italic text-white">
+                          Exportar Backup Completo (.json)
+                        </h5>
+                        <p className="text-xs text-zinc-400 leading-relaxed">
+                          Gera um arquivo único contendo todo o estoque atual, ordens de serviço, clientes, passaportes UTV, tabela de mão de obra, setores, usuários e dados da oficina <strong className="text-white">{currentTenant.name}</strong>.
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={handleExportFullBackupJson}
+                        className="w-full py-4 px-5 bg-green-500 hover:bg-green-400 text-black font-black uppercase text-[11px] tracking-wider rounded-2xl shadow-glow active:scale-95 transition-all flex items-center justify-center gap-2"
+                      >
+                        <Download size={16} /> Exportar Backup Completo (.json)
+                      </button>
+                    </div>
+
+                    {/* PASSO 2: IMPORTAR E MIGRAR */}
+                    <div className="bg-black border border-zinc-800 rounded-[2rem] p-6 sm:p-7 flex flex-col justify-between gap-6">
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="px-3 py-1 bg-zinc-900 border border-zinc-700 text-blue-400 text-[9px] font-black uppercase tracking-widest rounded-lg">
+                            Passo 2 • No Site Publicado (Netlify)
+                          </span>
+                          <Upload size={18} className="text-blue-400" />
+                        </div>
+                        <h5 className="text-base font-black uppercase italic text-white">
+                          Importar Backup e Migrar para o Supabase
+                        </h5>
+                        <p className="text-xs text-zinc-400 leading-relaxed">
+                          Carregue o arquivo <code className="text-green-400">.json</code> exportado da Área de Teste para restaurar todos os dados aqui e gravá-los automaticamente no banco Supabase.
+                        </p>
+
+                        {/* Toggle Substituição Limpa */}
+                        <label className="flex items-start gap-3 p-3.5 bg-zinc-900/80 border border-zinc-800 rounded-xl cursor-pointer hover:border-green-500/40 transition-colors">
+                          <input
+                            type="checkbox"
+                            checked={backupCleanReplace}
+                            onChange={e => setBackupCleanReplace(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 accent-green-500 rounded cursor-pointer shrink-0"
+                          />
+                          <div className="text-[11px] leading-snug">
+                            <span className="font-black uppercase text-white block">
+                              Substituir dados antigos no Supabase (Recomendado)
+                            </span>
+                            <span className="text-zinc-400 text-[10px]">
+                              Apaga os registros antigos desta oficina no Supabase antes de subir o backup, garantindo um espelho 100% idêntico à Área de Teste.
+                            </span>
+                          </div>
+                        </label>
+                      </div>
+
+                      <label
+                        className={`w-full py-4 px-5 font-black uppercase text-[11px] tracking-wider rounded-2xl active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer ${
+                          isMigratingBackup
+                            ? 'bg-zinc-800 text-zinc-400 pointer-events-none'
+                            : 'bg-blue-500 hover:bg-blue-400 text-black'
+                        }`}
+                      >
+                        {isMigratingBackup ? (
+                          <>
+                            <RefreshCw size={16} className="animate-spin" /> Migrando dados para o Supabase...
+                          </>
+                        ) : (
+                          <>
+                            <Upload size={16} /> Selecionar Backup (.json) e Migrar
+                          </>
+                        )}
+                        <input
+                          type="file"
+                          accept=".json,application/json"
+                          disabled={isMigratingBackup}
+                          onChange={handleImportFullBackupJson}
+                          className="hidden"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* Aviso de segurança / última operação */}
+                  {backupLastReport && (
+                    <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-2xl flex items-start gap-3">
+                      <CheckCircle2 size={18} className="text-green-400 shrink-0 mt-0.5" />
+                      <div className="text-xs text-zinc-200 space-y-0.5">
+                        <p className="font-black uppercase text-green-400 text-[10px] tracking-wider">
+                          {backupLastReport.mode === 'export' ? 'Último Backup Exportado' : 'Última Migração Realizada'} • {backupLastReport.timestamp}
+                        </p>
+                        <p className="text-zinc-300">{backupLastReport.summary}</p>
+                        {backupLastReport.mode === 'import' && (
+                          <p className="text-[10px] text-zinc-400">
+                            {backupLastReport.syncedToSupabase
+                              ? `Sincronizado com sucesso no Supabase (${backupLastReport.cleanReplace ? 'Substituição Limpa 1:1' : 'Mesclagem'}).`
+                              : 'Aplicado localmente neste navegador.'}
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {!supabaseService.isAvailable() && (
+                    <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-2xl flex items-start gap-3">
+                      <AlertTriangle size={18} className="text-amber-400 shrink-0 mt-0.5" />
+                      <p className="text-[11px] text-amber-200/90 leading-relaxed">
+                        <strong className="uppercase text-amber-300">Atenção:</strong> Neste endereço o sistema está rodando em modo local (Área de Teste). Clique em <strong>Exportar Backup Completo (.json)</strong> aqui e faça a <strong>Importação</strong> dentro do seu link publicado no <strong>Netlify</strong> para gravar tudo no seu banco Supabase.
+                      </p>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
           </div>
