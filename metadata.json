@@ -1,0 +1,10 @@
+{
+  "name": "HPS CONTROL",
+  "description": "Sistema de gestão especializada de estoque, clientes e ordens de serviço Can-Am BRP com integração Supabase e controle de QR code.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
