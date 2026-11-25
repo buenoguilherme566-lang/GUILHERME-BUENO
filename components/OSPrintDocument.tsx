@@ -41,11 +41,32 @@ export const getLaborDiscountAmount = (labor: LaborItem): number => {
   return Math.max(0, original - finalVal);
 };
 
+export const getPartOriginalValue = (part: OSPart): number => {
+  if (typeof part.originalTotal === 'number' && !isNaN(part.originalTotal)) {
+    return Math.max(0, part.originalTotal);
+  }
+  const baseQtyTotal = Math.round(((part.quantity || 0) * (part.unitValue || 0)) * 100) / 100;
+  if (typeof part.totalValue === 'number' && !isNaN(part.totalValue) && (part.discountValue || 0) > 0) {
+    return Math.round((part.totalValue + (part.discountValue || 0)) * 100) / 100;
+  }
+  return baseQtyTotal;
+};
+
 export const getPartFinalValue = (part: OSPart): number => {
   if (typeof part.totalValue === 'number' && !isNaN(part.totalValue)) {
-    return part.totalValue;
+    return Math.max(0, part.totalValue);
   }
-  return (part.quantity || 0) * (part.unitValue || 0);
+  const orig = getPartOriginalValue(part);
+  const disc = Math.max(0, Number(part.discountValue) || 0);
+  return Math.max(0, Math.round((orig - disc) * 100) / 100);
+};
+
+export const getPartDiscountAmount = (part: OSPart): number => {
+  const original = getPartOriginalValue(part);
+  const finalVal = getPartFinalValue(part);
+  const diff = Math.max(0, Math.round((original - finalVal) * 100) / 100);
+  if (diff > 0) return diff;
+  return Math.max(0, Number(part.discountValue) || 0);
 };
 
 /**
@@ -288,10 +309,13 @@ export const OSPrintDocument: React.FC<Props> = ({
 
   if (!os) return null;
 
+  const totalPartsGross = os.parts.reduce((acc, p) => acc + getPartOriginalValue(p), 0);
+  const totalPartsDiscount = os.parts.reduce((acc, p) => acc + getPartDiscountAmount(p), 0);
   const totalParts = os.parts.reduce((acc, p) => acc + getPartFinalValue(p), 0);
   const totalLaborGross = os.laborItems.reduce((acc, l) => acc + getLaborOriginalValue(l), 0);
   const totalLaborDiscount = os.laborItems.reduce((acc, l) => acc + getLaborDiscountAmount(l), 0);
   const totalLaborNet = os.laborItems.reduce((acc, l) => acc + getLaborFinalValue(l), 0);
+  const totalOverallDiscount = totalPartsDiscount + totalLaborDiscount;
   const grandTotal = totalParts + totalLaborNet;
 
   const handleSavePdf = async () => {
@@ -556,19 +580,25 @@ export const OSPrintDocument: React.FC<Props> = ({
               <th className="p-2">Part Number BRP</th>
               <th className="p-2 text-center">Quantidade</th>
               <th className="p-2 text-right">Valor Unitário</th>
+              <th className="p-2 text-right">Desconto</th>
               <th className="p-2 text-right">Subtotal</th>
             </tr>
           </thead>
           <tbody>
             {os.parts.length === 0 ? (
               <tr>
-                <td colSpan={6} className="p-3 text-center text-zinc-500 italic">
+                <td colSpan={7} className="p-3 text-center text-zinc-500 italic">
                   Nenhuma peça ou insumo registrado nesta Ordem de Serviço.
                 </td>
               </tr>
             ) : (
               os.parts.map((p, idx) => {
+                const origSubtotal = getPartOriginalValue(p);
+                const partDiscount = getPartDiscountAmount(p);
                 const subtotal = getPartFinalValue(p);
+                const discountPct = origSubtotal > 0 && partDiscount > 0
+                  ? Math.round((partDiscount / origSubtotal) * 1000) / 10
+                  : (p.discountPercentage || 0);
                 return (
                   <tr key={idx} className="border-b border-zinc-200 avoid-break">
                     <td className="p-2 font-mono text-[10px]">{idx + 1}</td>
@@ -578,6 +608,11 @@ export const OSPrintDocument: React.FC<Props> = ({
                         <span className="ml-2 text-[8.5px] font-black uppercase text-blue-700 bg-blue-50 px-1 py-0.5 rounded border border-blue-200">
                           {p.mlQuantity} ml ({p.quantity} L)
                         </span>
+                      ) : null}
+                      {partDiscount > 0 && p.discountReason ? (
+                        <div className="text-[8.5px] font-medium text-emerald-700 normal-case mt-0.5">
+                          Desc.: {p.discountReason}
+                        </div>
                       ) : null}
                     </td>
                     <td className="p-2 font-mono uppercase text-zinc-700 font-bold">{p.partNumber || 'S/ PN'}</td>
@@ -594,8 +629,27 @@ export const OSPrintDocument: React.FC<Props> = ({
                         `R$ ${p.unitValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`
                       )}
                     </td>
+                    <td className="p-2 text-right font-mono">
+                      {partDiscount > 0 ? (
+                        <span className="text-emerald-700 font-bold text-[10px]">
+                          - R$ {partDiscount.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                          {discountPct > 0 ? ` (${discountPct}%)` : ''}
+                        </span>
+                      ) : (
+                        <span className="text-zinc-400">—</span>
+                      )}
+                    </td>
                     <td className="p-2 text-right font-mono font-bold text-black">
-                      R$ {subtotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                      {partDiscount > 0 ? (
+                        <div>
+                          <div className="text-[8px] line-through text-zinc-400 font-normal">
+                            De: R$ {origSubtotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                          </div>
+                          <div>R$ {subtotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</div>
+                        </div>
+                      ) : (
+                        `R$ ${subtotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}`
+                      )}
                     </td>
                   </tr>
                 );
@@ -603,12 +657,32 @@ export const OSPrintDocument: React.FC<Props> = ({
             )}
           </tbody>
           <tfoot>
+            {totalPartsDiscount > 0 && (
+              <>
+                <tr className="bg-zinc-50 border-t border-zinc-300 text-[10px] text-zinc-600">
+                  <td colSpan={6} className="p-1.5 text-right uppercase font-bold">
+                    Subtotal Bruto Peças e Insumos:
+                  </td>
+                  <td className="p-1.5 text-right font-mono font-bold">
+                    R$ {totalPartsGross.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                  </td>
+                </tr>
+                <tr className="bg-emerald-50 border-t border-emerald-200 text-[10px] text-emerald-800">
+                  <td colSpan={6} className="p-1.5 text-right uppercase font-black">
+                    (-) Descontos Concedidos em Peças:
+                  </td>
+                  <td className="p-1.5 text-right font-mono font-black">
+                    - R$ {totalPartsDiscount.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                  </td>
+                </tr>
+              </>
+            )}
             <tr className="font-bold bg-zinc-100 border-t-2 border-black text-xs">
-              <td colSpan={5} className="p-2 text-right uppercase font-black">
-                Subtotal Peças e Insumos:
+              <td colSpan={6} className="p-2 text-right uppercase font-black">
+                {totalPartsDiscount > 0 ? 'Subtotal Líquido Peças e Insumos:' : 'Subtotal Peças e Insumos:'}
               </td>
               <td className="p-2 text-right font-mono font-black text-black text-sm">
-                R$ {totalParts.toLocaleString('pt-BR')}
+                R$ {totalParts.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
               </td>
             </tr>
           </tfoot>
@@ -641,24 +715,38 @@ export const OSPrintDocument: React.FC<Props> = ({
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
           <div className="space-y-1.5">
             <div className="flex justify-between items-center py-0.5 border-b border-zinc-200">
-              <span className="text-zinc-700 uppercase font-bold text-[11px]">(+) Total de Peças e Insumos:</span>
-              <span className="font-mono font-black text-xs">R$ {totalParts.toLocaleString('pt-BR')}</span>
+              <span className="text-zinc-700 uppercase font-bold text-[11px]">
+                {totalPartsDiscount > 0 ? '(+) Total de Peças e Insumos (Bruto):' : '(+) Total de Peças e Insumos:'}
+              </span>
+              <span className="font-mono font-black text-xs">R$ {totalPartsGross.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
             </div>
             <div className="flex justify-between items-center py-0.5 border-b border-zinc-200">
               <span className="text-zinc-700 uppercase font-bold text-[11px]">(+) Total Mão de Obra (Valor Bruto):</span>
-              <span className="font-mono font-black text-xs">R$ {totalLaborGross.toLocaleString('pt-BR')}</span>
+              <span className="font-mono font-black text-xs">R$ {totalLaborGross.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
             </div>
           </div>
 
           <div className="space-y-1.5">
+            {totalPartsDiscount > 0 && (
+              <div className="flex justify-between items-center py-0.5 border-b border-zinc-200 text-emerald-900 bg-emerald-100/70 px-1.5 rounded">
+                <span className="uppercase font-black text-[10px]">(-) Desconto em Peças e Insumos:</span>
+                <span className="font-mono font-black text-xs">- R$ {totalPartsDiscount.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+              </div>
+            )}
             <div className="flex justify-between items-center py-0.5 border-b border-zinc-200 text-amber-900 bg-amber-100/60 px-1.5 rounded">
               <span className="uppercase font-black text-[10px]">(-) Desconto M.O. Compartilhada:</span>
-              <span className="font-mono font-black text-xs">- R$ {totalLaborDiscount.toLocaleString('pt-BR')}</span>
+              <span className="font-mono font-black text-xs">- R$ {totalLaborDiscount.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
             </div>
+            {totalOverallDiscount > 0 && (
+              <div className="flex justify-between items-center py-0.5 text-zinc-700 text-[10px] px-1">
+                <span className="uppercase font-bold">Total de Descontos na O.S.:</span>
+                <span className="font-mono font-bold">- R$ {totalOverallDiscount.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</span>
+              </div>
+            )}
             <div className="pt-1.5 border-t-2 border-black flex justify-between items-center">
               <span className="uppercase font-black text-xs text-black">(=) VALOR TOTAL LÍQUIDO A FATURAR:</span>
               <span className="font-mono font-black text-base text-black">
-                R$ {grandTotal.toLocaleString('pt-BR')}
+                R$ {grandTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
               </span>
             </div>
           </div>

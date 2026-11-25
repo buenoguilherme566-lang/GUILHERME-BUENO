@@ -241,8 +241,8 @@ const upsertBatchResilient = async (
     } else if (errCode === 'PGRST204' || errMsg.includes('schema cache')) {
       if (tableName === 'history') {
         payload = Array.isArray(payload)
-          ? payload.map(({ notes, destination, osNumber, unitValue, userId, mechanicId, tenantId, ...rest }: any) => rest)
-          : (({ notes, destination, osNumber, unitValue, userId, mechanicId, tenantId, ...rest }: any) => rest)(payload);
+          ? payload.map(({ notes, destination, osNumber, unitValue, originalUnitValue, discountValue, discountPercentage, userId, mechanicId, tenantId, ...rest }: any) => rest)
+          : (({ notes, destination, osNumber, unitValue, originalUnitValue, discountValue, discountPercentage, userId, mechanicId, tenantId, ...rest }: any) => rest)(payload);
       } else if (tableName === 'users') {
         payload = Array.isArray(payload)
           ? payload.map(({ email, avatarUrl, password, tenantId, ...rest }: any) => rest)
@@ -505,6 +505,9 @@ CREATE TABLE IF NOT EXISTS history (
     type TEXT NOT NULL,
     quantity NUMERIC DEFAULT 0,
     "unitValue" NUMERIC DEFAULT 0,
+    "originalUnitValue" NUMERIC,
+    "discountValue" NUMERIC DEFAULT 0,
+    "discountPercentage" NUMERIC DEFAULT 0,
     date TEXT NOT NULL,
     destination TEXT,
     "osNumber" TEXT,
@@ -660,6 +663,9 @@ ALTER TABLE IF EXISTS items ADD COLUMN IF NOT EXISTS "purchaseHistory" JSONB DEF
 ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS "userId" TEXT;
 ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS quantity NUMERIC DEFAULT 0;
 ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS "unitValue" NUMERIC DEFAULT 0;
+ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS "originalUnitValue" NUMERIC;
+ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS "discountValue" NUMERIC DEFAULT 0;
+ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS "discountPercentage" NUMERIC DEFAULT 0;
 ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS destination TEXT;
 ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS "osNumber" TEXT;
 ALTER TABLE IF EXISTS history ADD COLUMN IF NOT EXISTS notes TEXT;
@@ -728,6 +734,9 @@ DO $$ BEGIN ALTER TABLE items ALTER COLUMN "minQuantity" TYPE NUMERIC USING "min
 DO $$ BEGIN ALTER TABLE items ALTER COLUMN value TYPE NUMERIC USING value::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE history ALTER COLUMN quantity TYPE NUMERIC USING quantity::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE history ALTER COLUMN "unitValue" TYPE NUMERIC USING "unitValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE history ALTER COLUMN "originalUnitValue" TYPE NUMERIC USING "originalUnitValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE history ALTER COLUMN "discountValue" TYPE NUMERIC USING "discountValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE history ALTER COLUMN "discountPercentage" TYPE NUMERIC USING "discountPercentage"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE labor_templates ALTER COLUMN "defaultHours" TYPE NUMERIC USING "defaultHours"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE labor_templates ALTER COLUMN "defaultValuePerHour" TYPE NUMERIC USING "defaultValuePerHour"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE labor_templates ALTER COLUMN "fixedValue" TYPE NUMERIC USING "fixedValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;

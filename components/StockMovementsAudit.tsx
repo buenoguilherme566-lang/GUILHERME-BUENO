@@ -5,6 +5,7 @@ import {
   Shield, RefreshCw, X, Tag, FileText, CheckCircle2, ChevronRight
 } from 'lucide-react';
 import { Transaction, InventoryItem, ServiceOrder, TransactionType, MovementDestination } from '../types';
+import { getTransactionFinancials } from './TransactionHistory';
 
 interface StockMovementsAuditProps {
   transactions: Transaction[];
@@ -97,21 +98,23 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
     let totalInValue = 0;
     let totalOutQty = 0;
     let totalOutValue = 0;
+    let totalOutDiscounts = 0;
     let osCount = 0;
     let internalCount = 0;
 
     filteredTransactions.forEach(t => {
       const item = items.find(i => i.id === t.itemId);
-      const unitVal = t.unitValue !== undefined ? Number(t.unitValue) : (Number(item?.value) || 0);
-      const qty = roundQty(Math.abs(Number(t.quantity) || 0));
-      const val = Math.round(unitVal * qty * 100) / 100;
+      const fin = getTransactionFinancials(t, item?.value || 0);
 
       if (t.type === TransactionType.IN) {
-        totalInQty = roundQty(totalInQty + qty);
-        totalInValue = Math.round((totalInValue + val) * 100) / 100;
+        totalInQty = roundQty(totalInQty + fin.qty);
+        totalInValue = Math.round((totalInValue + fin.netTotal) * 100) / 100;
       } else {
-        totalOutQty = roundQty(totalOutQty + qty);
-        totalOutValue = Math.round((totalOutValue + val) * 100) / 100;
+        totalOutQty = roundQty(totalOutQty + fin.qty);
+        totalOutValue = Math.round((totalOutValue + fin.netTotal) * 100) / 100;
+        if (fin.hasDiscount) {
+          totalOutDiscounts = Math.round((totalOutDiscounts + fin.discount) * 100) / 100;
+        }
         if (t.destination === MovementDestination.OS || t.osNumber) {
           osCount++;
         } else {
@@ -126,6 +129,7 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
       totalInValue,
       totalOutQty,
       totalOutValue,
+      totalOutDiscounts,
       osCount,
       internalCount,
       netValue: Math.round((totalInValue - totalOutValue) * 100) / 100
@@ -146,8 +150,12 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
       'Part Number (REF)',
       'Categoria',
       'Quantidade (UN)',
-      'Valor Unitário (R$)',
-      'Valor Total (R$)',
+      'Valor Unitário Tabela (R$)',
+      'Valor Bruto Total (R$)',
+      'Desconto Aplicado (R$)',
+      'Desconto (%)',
+      'Valor Unitário Líquido (R$)',
+      'Valor Total Líquido (R$)',
       'Destino / Finalidade',
       'Nº Ordem de Serviço (OS)',
       'Destinatário / Mecânico',
@@ -161,9 +169,7 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
       const partNumber = t.partNumber || item?.partNumber || 'S/ REF';
       const dateFormatted = new Date(t.date).toLocaleString('pt-BR');
       const typeLabel = t.type === TransactionType.IN ? 'ENTRADA' : 'SAÍDA';
-      const unitVal = t.unitValue !== undefined ? Number(t.unitValue) : (Number(item?.value) || 0);
-      const cleanQty = roundQty(Math.abs(Number(t.quantity) || 0));
-      const totalVal = Math.round(unitVal * cleanQty * 100) / 100;
+      const fin = getTransactionFinancials(t, item?.value || 0);
 
       let destinationText = '';
       if (t.type === TransactionType.IN) {
@@ -183,9 +189,13 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
         `"${(t.itemName || item?.name || '').replace(/"/g, '""')}"`,
         `"${partNumber.replace(/"/g, '""')}"`,
         `"${category.replace(/"/g, '""')}"`,
-        String(t.type === TransactionType.IN ? cleanQty : -cleanQty).replace('.', ','),
-        unitVal.toFixed(2).replace('.', ','),
-        totalVal.toFixed(2).replace('.', ','),
+        String(t.type === TransactionType.IN ? fin.qty : -fin.qty).replace('.', ','),
+        fin.grossUnit.toFixed(2).replace('.', ','),
+        fin.grossTotal.toFixed(2).replace('.', ','),
+        fin.discount.toFixed(2).replace('.', ','),
+        fin.discountPct.toFixed(1).replace('.', ','),
+        fin.netUnit.toFixed(2).replace('.', ','),
+        fin.netTotal.toFixed(2).replace('.', ','),
         `"${destinationText.replace(/"/g, '""')}"`,
         `"${(t.osNumber || '').replace(/"/g, '""')}"`,
         `"${(t.recipientName || '').replace(/"/g, '""')}"`,
@@ -313,9 +323,16 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
             </div>
             <p className="text-3xl sm:text-4xl font-black text-red-400">-{formatQty(auditMetrics.totalOutQty)} <span className="text-xs uppercase opacity-40 font-bold">UN</span></p>
           </div>
-          <p className="text-[9px] text-red-500/80 font-black uppercase tracking-wider mt-3">
-            R$ {auditMetrics.totalOutValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} baixados
-          </p>
+          <div className="mt-3 space-y-0.5">
+            <p className="text-[9px] text-red-500/80 font-black uppercase tracking-wider">
+              R$ {auditMetrics.totalOutValue.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} baixados
+            </p>
+            {auditMetrics.totalOutDiscounts > 0 && (
+              <p className="text-[8.5px] text-emerald-400 font-black uppercase tracking-wider">
+                Desc. Peças: -R$ {auditMetrics.totalOutDiscounts.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </p>
+            )}
+          </div>
         </div>
 
         {/* Destinação Predominante */}
@@ -499,9 +516,8 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
                 filteredTransactions.map(t => {
                   const item = items.find(i => i.id === t.itemId);
                   const isEntry = t.type === TransactionType.IN;
-                  const unitVal = t.unitValue !== undefined ? Number(t.unitValue) : (Number(item?.value) || 0);
-                  const cleanRowQty = roundQty(Math.abs(Number(t.quantity) || 0));
-                  const totalVal = Math.round(unitVal * cleanRowQty * 100) / 100;
+                  const fin = getTransactionFinancials(t, item?.value || 0);
+                  const cleanRowQty = fin.qty;
                   const partNumber = t.partNumber || item?.partNumber || 'S/ REF';
                   const category = item?.category;
 
@@ -569,12 +585,24 @@ export const StockMovementsAudit: React.FC<StockMovementsAuditProps> = ({
 
                       {/* Valores */}
                       <td className="p-6 text-right whitespace-nowrap">
-                        <div className="flex flex-col items-end">
-                          <span className="text-white font-black">
-                            R$ {totalVal.toFixed(2)}
+                        <div className="flex flex-col items-end gap-0.5">
+                          {fin.hasDiscount && (
+                            <span className="text-[9px] text-zinc-500 line-through font-mono">
+                              Bruto: R$ {fin.grossTotal.toFixed(2)}
+                            </span>
+                          )}
+                          <span className="text-white font-black font-mono">
+                            R$ {fin.netTotal.toFixed(2)}
                           </span>
+                          {fin.hasDiscount && (
+                            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-[8.5px] font-black uppercase">
+                              <Tag size={9} /> Desc: -R$ {fin.discount.toFixed(2)} ({fin.discountPct}%)
+                            </span>
+                          )}
                           <span className="text-[9px] text-zinc-500 font-bold">
-                            Unit: R$ {unitVal.toFixed(2)}
+                            {fin.hasDiscount
+                              ? `Unit. Líq: R$ ${fin.netUnit.toFixed(2)} (Tab: R$ ${fin.grossUnit.toFixed(2)})`
+                              : `Unit: R$ ${fin.netUnit.toFixed(2)}`}
                           </span>
                         </div>
                       </td>

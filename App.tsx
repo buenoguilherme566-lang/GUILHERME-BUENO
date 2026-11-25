@@ -23,7 +23,7 @@ import StockMovementsAudit from './components/StockMovementsAudit';
 import PartsSearchFilter, { SearchFieldType } from './components/PartsSearchFilter';
 import { UnitOfMeasureSelector } from './components/UnitOfMeasureSelector';
 import SharedLaborWarningModal, { SharedLaborWarningData } from './components/SharedLaborWarningModal';
-import OSPrintDocument, { getLaborFinalValue, getLaborDiscountAmount, getLaborOriginalValue, getPartFinalValue } from './components/OSPrintDocument';
+import OSPrintDocument, { getLaborFinalValue, getLaborDiscountAmount, getLaborOriginalValue, getPartFinalValue, getPartOriginalValue, getPartDiscountAmount } from './components/OSPrintDocument';
 import UTVPassportModule from './components/UTVPassportModule';
 import UTVPassportClientMirror from './components/UTVPassportClientMirror';
 import { checkLaborRelation, computeLaborGross, findLaborTemplateForPart } from './utils/laborUtils';
@@ -197,12 +197,19 @@ const App: React.FC = () => {
     itemId: '', 
     quantity: 1,
     measureMode: 'standard' as 'standard' | 'ml',
-    mlQuantity: 500
+    mlQuantity: 500,
+    discountType: 'fixed' as 'fixed' | 'percentage',
+    discountValue: 0,
+    discountPercentage: 0,
+    discountReason: ''
   });
   const [osPartSearchTerm, setOsPartSearchTerm] = useState('');
   const [editingOSPartIdx, setEditingOSPartIdx] = useState<number | null>(null);
   const [editingOSPartQtyInput, setEditingOSPartQtyInput] = useState<string>('');
   const [editingOSPartMode, setEditingOSPartMode] = useState<'standard' | 'ml'>('standard');
+  const [editingOSPartDiscountType, setEditingOSPartDiscountType] = useState<'fixed' | 'percentage'>('fixed');
+  const [editingOSPartDiscountInput, setEditingOSPartDiscountInput] = useState<string>('0');
+  const [editingOSPartDiscountReason, setEditingOSPartDiscountReason] = useState<string>('');
   const [formData, setFormData] = useState({
     name: '', partNumber: '', value: 0, quantity: 0, minQuantity: 1, 
     category: '' as any, boxNumber: '', linkedQRCode: '', imageUrl: '', observations: '',
@@ -2390,11 +2397,40 @@ const App: React.FC = () => {
     }
   };
 
+  const buildPartTransactionMeta = (part: OSPart, qtyForTx: number) => {
+    const fullQty = Number(part.quantity) || 0;
+    const grossUnit = Number(part.unitValue) || 0;
+    const fullDiscount = getPartDiscountAmount(part);
+    const ratio = fullQty > 0 ? Math.min(1, Math.max(0, qtyForTx / fullQty)) : 1;
+    const txDiscount = Math.round((fullDiscount * ratio) * 100) / 100;
+    const txGross = Math.round((grossUnit * qtyForTx) * 100) / 100;
+    const txNet = Math.max(0, Math.round((txGross - txDiscount) * 100) / 100);
+    const txNetUnit = qtyForTx > 0 ? Math.round((txNet / qtyForTx) * 10000) / 10000 : grossUnit;
+    const txDiscountPct = txGross > 0 && txDiscount > 0
+      ? Math.round((txDiscount / txGross) * 1000) / 10
+      : (part.discountPercentage || 0);
+    const discountNoteTag = txDiscount > 0
+      ? ` [Desc. Peça: -R$ ${txDiscount.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} (${txDiscountPct}%) | De R$ ${txGross.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} por R$ ${txNet.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${part.discountReason ? ` | Motivo: ${part.discountReason}` : ''}]`
+      : '';
+    return {
+      netUnitValue: txNetUnit,
+      originalUnitValue: grossUnit,
+      discountValue: txDiscount,
+      discountPercentage: txDiscountPct,
+      discountNoteTag
+    };
+  };
+
   const handleUpdatePartQuantityInOS = async (
     osId: string,
     partIndex: number,
     newVal: number,
-    mode: 'standard' | 'ml' = 'standard'
+    mode: 'standard' | 'ml' = 'standard',
+    discountConfig?: {
+      discountType: 'fixed' | 'percentage';
+      discountInput: number;
+      discountReason?: string;
+    }
   ) => {
     const os = serviceOrders.find(o => o.id === osId);
     if (!os) return;
@@ -2408,22 +2444,58 @@ const App: React.FC = () => {
 
     const oldQty = Number(targetPart.quantity) || 0;
     const oldMl = targetPart.mlQuantity;
+    const oldDiscount = getPartDiscountAmount(targetPart);
     const isMlMode = mode === 'ml' || (!mode && Boolean(targetPart.mlQuantity));
 
     let calculatedQty: number;
-    let calculatedTotalValue: number;
+    let grossTotal: number;
     let updatedMlQuantity: number | undefined = undefined;
 
     if (isMlMode) {
       updatedMlQuantity = newVal;
       calculatedQty = Math.round((newVal / 1000) * 10000) / 10000;
-      calculatedTotalValue = Math.round(((targetPart.unitValue / 1000) * newVal) * 100) / 100;
+      grossTotal = Math.round(((targetPart.unitValue / 1000) * newVal) * 100) / 100;
     } else {
       calculatedQty = Math.round(newVal * 10000) / 10000;
-      calculatedTotalValue = Math.round((calculatedQty * targetPart.unitValue) * 100) / 100;
+      grossTotal = Math.round((calculatedQty * targetPart.unitValue) * 100) / 100;
     }
 
-    if (calculatedQty === oldQty && updatedMlQuantity === oldMl) {
+    let nextDiscountType: 'fixed' | 'percentage' | undefined = targetPart.discountType;
+    let nextDiscountValue = 0;
+    let nextDiscountPct = 0;
+    let nextDiscountReason: string | undefined = targetPart.discountReason;
+
+    if (discountConfig) {
+      const rawInput = Math.max(0, Number(discountConfig.discountInput) || 0);
+      if (discountConfig.discountType === 'percentage') {
+        nextDiscountPct = Math.min(100, Math.round(rawInput * 100) / 100);
+        nextDiscountValue = Math.round(((grossTotal * nextDiscountPct) / 100) * 100) / 100;
+      } else {
+        nextDiscountValue = Math.min(grossTotal, Math.round(rawInput * 100) / 100);
+        nextDiscountPct = grossTotal > 0 ? Math.round((nextDiscountValue / grossTotal) * 10000) / 100 : 0;
+      }
+      nextDiscountType = nextDiscountValue > 0 ? discountConfig.discountType : undefined;
+      nextDiscountReason = nextDiscountValue > 0 && discountConfig.discountReason?.trim()
+        ? discountConfig.discountReason.trim()
+        : undefined;
+    } else if (oldDiscount > 0) {
+      if (targetPart.discountType === 'percentage' && (targetPart.discountPercentage || 0) > 0) {
+        nextDiscountPct = Math.min(100, Number(targetPart.discountPercentage) || 0);
+        nextDiscountValue = Math.round(((grossTotal * nextDiscountPct) / 100) * 100) / 100;
+      } else {
+        nextDiscountValue = Math.min(grossTotal, oldDiscount);
+        nextDiscountPct = grossTotal > 0 ? Math.round((nextDiscountValue / grossTotal) * 10000) / 100 : 0;
+      }
+    }
+
+    const calculatedTotalValue = Math.max(0, Math.round((grossTotal - nextDiscountValue) * 100) / 100);
+
+    if (
+      calculatedQty === oldQty &&
+      updatedMlQuantity === oldMl &&
+      nextDiscountValue === oldDiscount &&
+      (nextDiscountReason || '') === (targetPart.discountReason || '')
+    ) {
       setEditingOSPartIdx(null);
       return;
     }
@@ -2433,6 +2505,11 @@ const App: React.FC = () => {
       quantity: calculatedQty,
       measureMode: isMlMode ? 'ml' : 'standard',
       mlQuantity: isMlMode ? updatedMlQuantity : undefined,
+      originalTotal: grossTotal,
+      discountType: nextDiscountValue > 0 ? (nextDiscountType || 'fixed') : undefined,
+      discountValue: nextDiscountValue,
+      discountPercentage: nextDiscountValue > 0 ? nextDiscountPct : 0,
+      discountReason: nextDiscountReason,
       totalValue: calculatedTotalValue
     };
 
@@ -2448,6 +2525,7 @@ const App: React.FC = () => {
     const diffQty = Math.round((calculatedQty - oldQty) * 10000) / 10000;
     let updatedStockItem: InventoryItem | null = null;
     let adjustmentTx: Transaction | null = null;
+    let updatedExistingTxs: Transaction[] = [];
 
     if (os.stockDeducted && matchedItem && diffQty !== 0) {
       const newStockBalance = Math.max(0, Math.round((matchedItem.quantity - diffQty) * 10000) / 10000);
@@ -2455,6 +2533,7 @@ const App: React.FC = () => {
         ...matchedItem,
         quantity: newStockBalance
       };
+      const txMeta = buildPartTransactionMeta(updatedPart, Math.abs(diffQty));
       adjustmentTx = {
         id: generateId(),
         itemId: matchedItem.id,
@@ -2464,17 +2543,47 @@ const App: React.FC = () => {
         userName: currentUser?.name || 'Administrador HPS',
         type: diffQty > 0 ? TransactionType.OUT : TransactionType.IN,
         quantity: Math.abs(diffQty),
-        unitValue: targetPart.unitValue,
+        unitValue: txMeta.netUnitValue,
+        originalUnitValue: txMeta.originalUnitValue,
+        discountValue: txMeta.discountValue,
+        discountPercentage: txMeta.discountPercentage,
         date: new Date().toISOString(),
         recipientName: os.mechanicName || os.customerName || `O.S. #${os.osNumber}`,
         destination: MovementDestination.OS,
         osNumber: os.osNumber,
-        notes: `Ajuste de quantidade na O.S. #${os.osNumber}: alterado de ${oldMl ? `${oldMl} ml (${oldQty} L)` : `${oldQty} ${targetPart.unit || 'un'}`} para ${isMlMode ? `${updatedMlQuantity} ml (${calculatedQty} L)` : `${calculatedQty} ${targetPart.unit || 'un'}`}`,
+        notes: `Ajuste de quantidade na O.S. #${os.osNumber}: alterado de ${oldMl ? `${oldMl} ml (${oldQty} L)` : `${oldQty} ${targetPart.unit || 'un'}`} para ${isMlMode ? `${updatedMlQuantity} ml (${calculatedQty} L)` : `${calculatedQty} ${targetPart.unit || 'un'}`}${txMeta.discountNoteTag}`,
         tenantId: currentTenant.id
       };
 
       setItems(prev => prev.map(i => (i.id === matchedItem.id ? updatedStockItem! : i)));
       setHistory(prev => [adjustmentTx!, ...prev]);
+    } else if (os.stockDeducted && diffQty === 0 && nextDiscountValue !== oldDiscount) {
+      // Se a baixa já ocorreu e o usuário alterou apenas o desconto da peça, sincroniza o registro de saída existente no histórico
+      const txMeta = buildPartTransactionMeta(updatedPart, updatedPart.quantity);
+      const nextHistory = history.map(tx => {
+        if (
+          tx.osNumber === os.osNumber &&
+          tx.itemId === targetPart.itemId &&
+          tx.type === TransactionType.OUT &&
+          Math.abs(Number(tx.quantity) - updatedPart.quantity) < 0.001
+        ) {
+          const baseNotes = (tx.notes || `Baixa de peças para O.S. #${os.osNumber}`).replace(/\s*\[Desc\.\s*Peça:[^\]]*\]/gi, '').trim();
+          const refreshedTx: Transaction = {
+            ...tx,
+            unitValue: txMeta.netUnitValue,
+            originalUnitValue: txMeta.originalUnitValue,
+            discountValue: txMeta.discountValue,
+            discountPercentage: txMeta.discountPercentage,
+            notes: `${baseNotes}${txMeta.discountNoteTag}`
+          };
+          updatedExistingTxs.push(refreshedTx);
+          return refreshedTx;
+        }
+        return tx;
+      });
+      if (updatedExistingTxs.length > 0) {
+        setHistory(nextHistory);
+      }
     }
 
     setServiceOrders(prev => prev.map(o => (o.id === osId ? updatedOS : o)));
@@ -2492,17 +2601,23 @@ const App: React.FC = () => {
         if (adjustmentTx) {
           await supabaseService.saveTransaction(adjustmentTx);
         }
+        if (updatedExistingTxs.length > 0) {
+          await Promise.all(updatedExistingTxs.map(tx => supabaseService.saveTransaction(tx)));
+        }
       } catch (err) {
-        console.error("Erro ao sincronizar alteração de quantidade da peça na OS com o Supabase:", err);
+        console.error("Erro ao sincronizar alteração da peça na OS com o Supabase:", err);
       }
     }
 
     const oldLabel = oldMl ? `${oldMl} ml` : `${oldQty} ${targetPart.unit || matchedItem?.unit || 'un'}`;
     const newLabel = isMlMode ? `${updatedMlQuantity} ml` : `${calculatedQty} ${targetPart.unit || matchedItem?.unit || 'un'}`;
+    const discountSummaryMsg = nextDiscountValue > 0
+      ? ` com desconto de -R$ ${nextDiscountValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} (${nextDiscountPct}%)`
+      : '';
 
     showAlert(
-      "Quantidade Atualizada",
-      `A quantidade do item "${targetPart.name}" na O.S. #${os.osNumber} foi alterada de ${oldLabel} para ${newLabel} (Novo subtotal: R$ ${calculatedTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })})${os.stockDeducted && matchedItem ? `. O saldo do estoque foi reconciliado automaticamente.` : '.'}`,
+      "Item Atualizado na O.S.",
+      `O item "${targetPart.name}" na O.S. #${os.osNumber} foi atualizado (${oldLabel} → ${newLabel})${discountSummaryMsg}. Novo subtotal: R$ ${calculatedTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}${os.stockDeducted && matchedItem && diffQty !== 0 ? `. O saldo do estoque foi reconciliado automaticamente.` : '.'}`,
       "success"
     );
   };
@@ -2529,6 +2644,7 @@ const App: React.FC = () => {
           );
           if (matchedItem) {
             const newQty = Math.round((matchedItem.quantity + (removedPart.quantity || 0)) * 1000) / 1000;
+            const txMeta = buildPartTransactionMeta(removedPart, removedPart.quantity || 0);
             returnedItem = { ...matchedItem, quantity: newQty };
             returnTx = {
               id: generateId(),
@@ -2539,12 +2655,15 @@ const App: React.FC = () => {
               userName: currentUser?.name || 'Administrador HPS',
               type: TransactionType.IN,
               quantity: removedPart.quantity,
-              unitValue: removedPart.unitValue,
+              unitValue: txMeta.netUnitValue,
+              originalUnitValue: txMeta.originalUnitValue,
+              discountValue: txMeta.discountValue,
+              discountPercentage: txMeta.discountPercentage,
               date: new Date().toISOString(),
               recipientName: os.mechanicName || os.customerName || `O.S. #${os.osNumber}`,
               destination: MovementDestination.OS,
               osNumber: os.osNumber,
-              notes: `Estorno automático de estoque por remoção da peça "${removedPart.name}" da O.S. #${os.osNumber}`,
+              notes: `Estorno automático de estoque por remoção da peça "${removedPart.name}" da O.S. #${os.osNumber}${txMeta.discountNoteTag}`,
               tenantId: currentTenant.id
             };
             setItems(prev => prev.map(i => i.id === matchedItem.id ? returnedItem! : i));
@@ -3019,7 +3138,7 @@ const App: React.FC = () => {
 
     const isMl = osPartFormData.measureMode === 'ml';
     let calculatedQty: number;
-    let calculatedTotalValue: number;
+    let grossTotalValue: number;
     let mlValue: number | undefined = undefined;
 
     if (isMl) {
@@ -3033,8 +3152,8 @@ const App: React.FC = () => {
       // Divisão automática do valor do litro pelo ML utilizado:
       // Fração em litros para baixa do estoque: ml / 1000
       calculatedQty = Math.round((ml / 1000) * 10000) / 10000;
-      // Valor total na OS: (valor_litro / 1000) * ml
-      calculatedTotalValue = Math.round(((item.value / 1000) * ml) * 100) / 100;
+      // Valor bruto na OS: (valor_litro / 1000) * ml
+      grossTotalValue = Math.round(((item.value / 1000) * ml) * 100) / 100;
     } else {
       const qty = osPartFormData.quantity;
       if (!qty || qty <= 0) {
@@ -3042,8 +3161,20 @@ const App: React.FC = () => {
         return;
       }
       calculatedQty = qty;
-      calculatedTotalValue = Math.round((qty * item.value) * 100) / 100;
+      grossTotalValue = Math.round((qty * item.value) * 100) / 100;
     }
+
+    // Cálculo de desconto customizado na peça (em R$ ou %)
+    let partDiscountVal = 0;
+    let partDiscountPct = 0;
+    if (osPartFormData.discountType === 'percentage') {
+      partDiscountPct = Math.min(100, Math.max(0, Math.round((Number(osPartFormData.discountPercentage) || 0) * 100) / 100));
+      partDiscountVal = Math.round(((grossTotalValue * partDiscountPct) / 100) * 100) / 100;
+    } else {
+      partDiscountVal = Math.min(grossTotalValue, Math.max(0, Math.round((Number(osPartFormData.discountValue) || 0) * 100) / 100));
+      partDiscountPct = grossTotalValue > 0 ? Math.round((partDiscountVal / grossTotalValue) * 10000) / 100 : 0;
+    }
+    const calculatedTotalValue = Math.max(0, Math.round((grossTotalValue - partDiscountVal) * 100) / 100);
 
     // Check if we have enough quantity. If they don't, we show an informational alert
     // but WE STILL ALLOW linking! The part will display "Aguardando Reposição" in the UI.
@@ -3079,6 +3210,11 @@ const App: React.FC = () => {
       unit: item.unit || 'un',
       measureMode: isMl ? 'ml' : 'standard',
       mlQuantity: mlValue,
+      originalTotal: grossTotalValue,
+      discountType: partDiscountVal > 0 ? osPartFormData.discountType : undefined,
+      discountValue: partDiscountVal,
+      discountPercentage: partDiscountVal > 0 ? partDiscountPct : 0,
+      discountReason: partDiscountVal > 0 && osPartFormData.discountReason.trim() ? osPartFormData.discountReason.trim() : undefined,
       totalValue: calculatedTotalValue,
       stockDeducted: false
     };
@@ -3088,7 +3224,16 @@ const App: React.FC = () => {
       if (selectedOS && selectedOS.id === osId) {
         setSelectedOS(osToUpdate);
       }
-      setOsPartFormData({ itemId: '', quantity: 1, measureMode: 'standard', mlQuantity: 500 });
+      setOsPartFormData({
+        itemId: '',
+        quantity: 1,
+        measureMode: 'standard',
+        mlQuantity: 500,
+        discountType: 'fixed',
+        discountValue: 0,
+        discountPercentage: 0,
+        discountReason: ''
+      });
       setOsPartSearchTerm('');
       setOsPartTargetLaborId('');
       setOsPartSharedLaborId('');
@@ -3100,12 +3245,15 @@ const App: React.FC = () => {
       if (supabaseService.isAvailable()) {
         supabaseService.saveServiceOrder(osToUpdate).catch(err => console.error("Erro ao sincronizar peças da OS no Supabase", err));
       }
+      const partDiscNote = partDiscountVal > 0
+        ? ` (Desconto aplicado: -R$ ${partDiscountVal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} → Líquido: R$ ${calculatedTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })})`
+        : '';
       showAlert(
         "Sucesso", 
         customSuccessMsg || (
           isMl
-            ? `Óleo vinculado com sucesso! (${mlValue} ml calculados proporcionalmente: R$ ${calculatedTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })})`
-            : "Peça vinculada à Ordem de Serviço com sucesso!"
+            ? `Óleo vinculado com sucesso! (${mlValue} ml calculados proporcionalmente: R$ ${calculatedTotalValue.toLocaleString('pt-BR', { minimumFractionDigits: 2 })})${partDiscNote}`
+            : `Peça vinculada à Ordem de Serviço com sucesso!${partDiscNote}`
         ),
         "success"
       );
@@ -3323,25 +3471,32 @@ const App: React.FC = () => {
           return item;
         });
 
-        const newTransactions: Transaction[] = effectiveParts.map(p => ({
-          id: generateId(),
-          itemId: p.itemId,
-          itemName: p.name,
-          partNumber: p.partNumber,
-          userId: currentUser?.id || 'user_admin',
-          userName: currentUser?.name || 'Administrador HPS',
-          type: TransactionType.OUT,
-          quantity: p.quantity,
-          unitValue: p.unitValue,
-          date: new Date().toISOString(),
-          recipientName: os.mechanicName || os.customerName || ('O.S. #' + os.osNumber),
-          destination: MovementDestination.OS,
-          osNumber: os.osNumber,
-          notes: p.mlQuantity 
+        const newTransactions: Transaction[] = effectiveParts.map(p => {
+          const txMeta = buildPartTransactionMeta(p, p.quantity);
+          const baseNote = p.mlQuantity
             ? `Baixa fracionada de ${p.mlQuantity} ml (${p.quantity} L) de óleo/fluido para O.S. #${os.osNumber} (Cliente: ${os.customerName || 'N/D'})`
-            : `Baixa de peças para O.S. #${os.osNumber} (Cliente: ${os.customerName || 'N/D'})`,
-          tenantId: currentTenant.id
-        }));
+            : `Baixa de peças para O.S. #${os.osNumber} (Cliente: ${os.customerName || 'N/D'})`;
+          return {
+            id: generateId(),
+            itemId: p.itemId,
+            itemName: p.name,
+            partNumber: p.partNumber,
+            userId: currentUser?.id || 'user_admin',
+            userName: currentUser?.name || 'Administrador HPS',
+            type: TransactionType.OUT,
+            quantity: p.quantity,
+            unitValue: txMeta.netUnitValue,
+            originalUnitValue: txMeta.originalUnitValue,
+            discountValue: txMeta.discountValue,
+            discountPercentage: txMeta.discountPercentage,
+            date: new Date().toISOString(),
+            recipientName: os.mechanicName || os.customerName || ('O.S. #' + os.osNumber),
+            destination: MovementDestination.OS,
+            osNumber: os.osNumber,
+            notes: `${baseNote}${txMeta.discountNoteTag}`,
+            tenantId: currentTenant.id
+          };
+        });
 
         const updatedPartsWithFlag = os.parts.map(p => ({
           ...p,
@@ -3410,23 +3565,29 @@ const App: React.FC = () => {
           return item;
         });
 
-        const returnTransactions: Transaction[] = os.parts.map(p => ({
-          id: generateId(),
-          itemId: p.itemId,
-          itemName: p.name,
-          partNumber: p.partNumber,
-          userId: currentUser?.id || 'user_admin',
-          userName: currentUser?.name || 'Administrador HPS',
-          type: TransactionType.IN,
-          quantity: p.quantity,
-          unitValue: p.unitValue,
-          date: new Date().toISOString(),
-          recipientName: os.mechanicName || os.customerName || ('O.S. #' + os.osNumber),
-          destination: MovementDestination.OS,
-          osNumber: os.osNumber,
-          notes: `Estorno de baixa de estoque da O.S. #${os.osNumber}`,
-          tenantId: currentTenant.id
-        }));
+        const returnTransactions: Transaction[] = os.parts.map(p => {
+          const txMeta = buildPartTransactionMeta(p, p.quantity);
+          return {
+            id: generateId(),
+            itemId: p.itemId,
+            itemName: p.name,
+            partNumber: p.partNumber,
+            userId: currentUser?.id || 'user_admin',
+            userName: currentUser?.name || 'Administrador HPS',
+            type: TransactionType.IN,
+            quantity: p.quantity,
+            unitValue: txMeta.netUnitValue,
+            originalUnitValue: txMeta.originalUnitValue,
+            discountValue: txMeta.discountValue,
+            discountPercentage: txMeta.discountPercentage,
+            date: new Date().toISOString(),
+            recipientName: os.mechanicName || os.customerName || ('O.S. #' + os.osNumber),
+            destination: MovementDestination.OS,
+            osNumber: os.osNumber,
+            notes: `Estorno de baixa de estoque da O.S. #${os.osNumber}${txMeta.discountNoteTag}`,
+            tenantId: currentTenant.id
+          };
+        });
 
         const updatedPartsReset = os.parts.map(p => ({
           ...p,
@@ -6078,17 +6239,24 @@ const App: React.FC = () => {
                                     {os.parts.length} Peças / {os.laborItems.length} Serviços
                                   </span>
                                   {(() => {
+                                    const partsDiscount = os.parts.reduce((acc, p) => acc + getPartDiscountAmount(p), 0);
                                     const grossLabor = os.laborItems.reduce((acc, l) => acc + getLaborOriginalValue(l), 0);
                                     const netLabor = os.laborItems.reduce((acc, l) => acc + getLaborFinalValue(l), 0);
                                     const laborDiscount = grossLabor - netLabor;
-                                    if (laborDiscount > 0) {
-                                      return (
-                                        <span className="mt-1 inline-flex items-center gap-1 text-[8px] font-black text-amber-400 uppercase bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20">
-                                          🔗 M.O. Compartilhada (-R$ {laborDiscount.toLocaleString('pt-BR')})
-                                        </span>
-                                      );
-                                    }
-                                    return null;
+                                    return (
+                                      <>
+                                        {partsDiscount > 0 && (
+                                          <span className="mt-1 inline-flex items-center gap-1 text-[8px] font-black text-emerald-400 uppercase bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20 w-fit">
+                                            🏷️ Desc. Peças (-R$ {partsDiscount.toLocaleString('pt-BR', { minimumFractionDigits: 2 })})
+                                          </span>
+                                        )}
+                                        {laborDiscount > 0 && (
+                                          <span className="mt-1 inline-flex items-center gap-1 text-[8px] font-black text-amber-400 uppercase bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/20 w-fit">
+                                            🔗 M.O. Compartilhada (-R$ {laborDiscount.toLocaleString('pt-BR')})
+                                          </span>
+                                        )}
+                                      </>
+                                    );
                                   })()}
                                 </div>
                                 <div className="text-right">
@@ -11069,9 +11237,28 @@ const App: React.FC = () => {
                       <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-green-500 italic flex items-center gap-2">
                         <Package size={14} /> Peças e Insumos ({selectedOS.parts.length})
                       </h4>
-                      <span className="text-[9px] font-mono text-zinc-400">
-                        Total: R$ {selectedOS.parts.reduce((acc, p) => acc + getPartFinalValue(p), 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </span>
+                      {(() => {
+                        const partsGross = selectedOS.parts.reduce((acc, p) => acc + getPartOriginalValue(p), 0);
+                        const partsDisc = selectedOS.parts.reduce((acc, p) => acc + getPartDiscountAmount(p), 0);
+                        const partsNet = selectedOS.parts.reduce((acc, p) => acc + getPartFinalValue(p), 0);
+                        return (
+                          <div className="flex items-center gap-2 text-[9px] font-mono">
+                            {partsDisc > 0 && (
+                              <span className="text-emerald-400 font-black bg-emerald-500/10 border border-emerald-500/30 px-2 py-0.5 rounded">
+                                Desc: -R$ {partsDisc.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </span>
+                            )}
+                            <span className="text-zinc-400">
+                              {partsDisc > 0 && (
+                                <span className="line-through text-zinc-600 mr-1.5">
+                                  R$ {partsGross.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                </span>
+                              )}
+                              Total: <strong className="text-green-400">R$ {partsNet.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
+                            </span>
+                          </div>
+                        );
+                      })()}
                    </div>
                    <div className="space-y-3 max-h-80 overflow-y-auto pr-1">
                       {selectedOS.parts.length === 0 ? (
@@ -11080,7 +11267,12 @@ const App: React.FC = () => {
                         const matchedItem = items.find(i => i.id === part.itemId);
                         const isWaitingReplenishment = matchedItem ? matchedItem.quantity < part.quantity : true;
                         const hasLowStock = matchedItem ? matchedItem.quantity <= matchedItem.minQuantity : false;
+                        const partOrig = getPartOriginalValue(part);
+                        const partDisc = getPartDiscountAmount(part);
                         const partTotal = getPartFinalValue(part);
+                        const partDiscPct = partOrig > 0 && partDisc > 0
+                          ? Math.round((partDisc / partOrig) * 1000) / 10
+                          : (part.discountPercentage || 0);
                         const isEditingThisPart = editingOSPartIdx === idx;
                         const unitLabel = part.unit || matchedItem?.unit || 'un';
                         const isPartMl = Boolean(part.measureMode === 'ml' || part.mlQuantity);
@@ -11100,6 +11292,11 @@ const App: React.FC = () => {
                                          QTD: {part.quantity} {unitLabel}
                                        </span>
                                      )}
+                                     {partDisc > 0 && (
+                                       <span className="px-2 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-[8px] font-black uppercase font-mono flex items-center gap-1">
+                                         <Tag size={9} /> DESC: -R$ {partDisc.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} ({partDiscPct}%)
+                                       </span>
+                                     )}
                                    </div>
                                    <span className="text-[8px] text-zinc-500 font-mono uppercase mt-0.5">
                                      PN: {part.partNumber || 'S/ PN'} | {part.mlQuantity ? (
@@ -11108,11 +11305,23 @@ const App: React.FC = () => {
                                        `${part.quantity} ${unitLabel} x R$ ${part.unitValue.toFixed(2).replace('.', ',')}`
                                      )}
                                    </span>
+                                   {partDisc > 0 && part.discountReason && (
+                                     <span className="text-[8px] text-emerald-400/90 font-bold italic mt-0.5">
+                                       Motivo desconto: {part.discountReason}
+                                     </span>
+                                   )}
                                 </div>
                                 <div className="flex items-center gap-1.5 shrink-0">
-                                   <span className="text-sm font-black text-green-500 font-mono mr-1">
-                                     R$ {partTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                   </span>
+                                   <div className="text-right mr-1">
+                                     {partDisc > 0 && (
+                                       <span className="block text-[9px] text-zinc-500 line-through font-mono leading-none">
+                                         R$ {partOrig.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                       </span>
+                                     )}
+                                     <span className="text-sm font-black text-green-500 font-mono">
+                                       R$ {partTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                     </span>
+                                   </div>
                                    <button
                                      type="button"
                                      onClick={() => {
@@ -11124,6 +11333,14 @@ const App: React.FC = () => {
                                          setEditingOSPartQtyInput(
                                            isPartMl ? String(part.mlQuantity || Math.round(part.quantity * 1000)) : String(part.quantity)
                                          );
+                                         const dType = part.discountType || 'fixed';
+                                         setEditingOSPartDiscountType(dType);
+                                         setEditingOSPartDiscountInput(
+                                           dType === 'percentage'
+                                             ? String(part.discountPercentage || 0)
+                                             : String(partDisc || 0)
+                                         );
+                                         setEditingOSPartDiscountReason(part.discountReason || '');
                                        }
                                      }}
                                      className={`px-2.5 py-1.5 rounded-lg text-[8px] font-black uppercase flex items-center gap-1 transition-all border ${
@@ -11131,10 +11348,10 @@ const App: React.FC = () => {
                                          ? 'bg-green-500 text-black border-green-400'
                                          : 'bg-zinc-900 hover:bg-zinc-800 text-zinc-300 hover:text-green-400 border-zinc-800'
                                      }`}
-                                     title="Alterar quantidade lançada deste item na O.S."
+                                     title="Alterar quantidade e desconto deste item na O.S."
                                    >
                                      <Pencil size={11} />
-                                     <span>Alterar Qtd</span>
+                                     <span>Qtd / Desc.</span>
                                    </button>
                                    <button 
                                      type="button" 
@@ -11147,12 +11364,12 @@ const App: React.FC = () => {
                                 </div>
                              </div>
 
-                             {/* Painel de Edição de Quantidade Pós-Lançamento */}
+                             {/* Painel de Edição de Quantidade e Desconto Pós-Lançamento */}
                              {isEditingThisPart && (
                                <div className="p-3 bg-zinc-950 border border-green-500/40 rounded-xl space-y-2.5 animate-in fade-in duration-150">
                                  <div className="flex items-center justify-between">
                                    <span className="text-[8px] font-black uppercase text-green-400 tracking-wider flex items-center gap-1.5">
-                                     <Pencil size={10} /> Editar Quantidade Lançada ({isPartMl ? 'em ML' : `em ${unitLabel.toUpperCase()}`})
+                                     <Pencil size={10} /> Editar Quantidade e Desconto ({isPartMl ? 'em ML' : `em ${unitLabel.toUpperCase()}`})
                                    </span>
                                    <span className="text-[8px] font-mono text-zinc-400">
                                      Atual: <strong className="text-white">{isPartMl ? `${part.mlQuantity} ml` : `${part.quantity} ${unitLabel}`}</strong>
@@ -11190,7 +11407,12 @@ const App: React.FC = () => {
                                              selectedOS.id,
                                              idx,
                                              parseFloat(editingOSPartQtyInput),
-                                             editingOSPartMode
+                                             editingOSPartMode,
+                                             {
+                                               discountType: editingOSPartDiscountType,
+                                               discountInput: parseFloat(editingOSPartDiscountInput) || 0,
+                                               discountReason: editingOSPartDiscountReason
+                                             }
                                            );
                                          } else if (e.key === 'Escape') {
                                            setEditingOSPartIdx(null);
@@ -11226,7 +11448,12 @@ const App: React.FC = () => {
                                          selectedOS.id,
                                          idx,
                                          parseFloat(editingOSPartQtyInput),
-                                         editingOSPartMode
+                                         editingOSPartMode,
+                                         {
+                                           discountType: editingOSPartDiscountType,
+                                           discountInput: parseFloat(editingOSPartDiscountInput) || 0,
+                                           discountReason: editingOSPartDiscountReason
+                                         }
                                        )
                                      }
                                      className="px-3.5 py-2 bg-green-500 hover:bg-green-400 text-black font-black text-[9px] uppercase rounded-lg transition-all flex items-center gap-1 shadow-glow"
@@ -11243,20 +11470,83 @@ const App: React.FC = () => {
                                    </button>
                                  </div>
 
-                                 {/* Prévia do novo subtotal */}
+                                 {/* Edição do Desconto da Peça */}
+                                 <div className="p-2.5 bg-black/80 border border-emerald-500/30 rounded-lg space-y-2">
+                                   <div className="flex items-center justify-between gap-2">
+                                     <span className="text-[8px] font-black uppercase text-emerald-400 tracking-wider flex items-center gap-1">
+                                       <Tag size={10} /> Desconto nesta Peça (Opcional)
+                                     </span>
+                                     <div className="flex items-center gap-1 bg-zinc-900 p-0.5 rounded-md border border-zinc-800">
+                                       <button
+                                         type="button"
+                                         onClick={() => setEditingOSPartDiscountType('fixed')}
+                                         className={`px-2 py-0.5 rounded text-[8px] font-black uppercase ${
+                                           editingOSPartDiscountType === 'fixed' ? 'bg-emerald-500 text-black' : 'text-zinc-400 hover:text-white'
+                                         }`}
+                                       >
+                                         R$ Valor
+                                       </button>
+                                       <button
+                                         type="button"
+                                         onClick={() => setEditingOSPartDiscountType('percentage')}
+                                         className={`px-2 py-0.5 rounded text-[8px] font-black uppercase ${
+                                           editingOSPartDiscountType === 'percentage' ? 'bg-emerald-500 text-black' : 'text-zinc-400 hover:text-white'
+                                         }`}
+                                       >
+                                         % Porc.
+                                       </button>
+                                     </div>
+                                   </div>
+
+                                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                     <div className="relative">
+                                       <input
+                                         type="number"
+                                         min="0"
+                                         step="0.01"
+                                         value={editingOSPartDiscountInput}
+                                         onChange={e => setEditingOSPartDiscountInput(e.target.value)}
+                                         className="w-full bg-zinc-950 border border-emerald-500/40 focus:border-emerald-400 px-3 py-1.5 pr-10 rounded-lg text-emerald-400 font-mono font-black text-xs outline-none"
+                                         placeholder={editingOSPartDiscountType === 'percentage' ? 'Ex: 15' : 'Ex: 20,00'}
+                                       />
+                                       <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[8.5px] font-mono font-black text-emerald-500">
+                                         {editingOSPartDiscountType === 'percentage' ? '%' : 'R$'}
+                                       </span>
+                                     </div>
+                                     <input
+                                       type="text"
+                                       value={editingOSPartDiscountReason}
+                                       onChange={e => setEditingOSPartDiscountReason(e.target.value)}
+                                       placeholder="Motivo / obs. do desconto (opcional)"
+                                       className="w-full bg-zinc-950 border border-zinc-800 focus:border-emerald-500 px-2.5 py-1.5 rounded-lg text-zinc-200 text-[9.5px] outline-none"
+                                     />
+                                   </div>
+                                 </div>
+
+                                 {/* Prévia do novo subtotal com desconto */}
                                  {(() => {
                                    const parsedVal = parseFloat(editingOSPartQtyInput);
                                    if (isNaN(parsedVal) || parsedVal <= 0) return null;
-                                   const previewTotal = editingOSPartMode === 'ml'
+                                   const previewGross = editingOSPartMode === 'ml'
                                      ? Math.round(((part.unitValue / 1000) * parsedVal) * 100) / 100
                                      : Math.round((parsedVal * part.unitValue) * 100) / 100;
+                                   const rawDisc = Math.max(0, parseFloat(editingOSPartDiscountInput) || 0);
+                                   const previewDisc = editingOSPartDiscountType === 'percentage'
+                                     ? Math.round(((previewGross * Math.min(100, rawDisc)) / 100) * 100) / 100
+                                     : Math.min(previewGross, Math.round(rawDisc * 100) / 100);
+                                   const previewNet = Math.max(0, Math.round((previewGross - previewDisc) * 100) / 100);
                                    return (
-                                     <div className="flex items-center justify-between text-[8px] font-mono pt-1 border-t border-zinc-800/80 text-zinc-400">
+                                     <div className="flex flex-wrap items-center justify-between gap-2 text-[8.5px] font-mono pt-1 border-t border-zinc-800/80 text-zinc-400">
                                        <span>
-                                         Novo cálculo: {parsedVal} {editingOSPartMode === 'ml' ? 'ml' : unitLabel} x R$ {editingOSPartMode === 'ml' ? (part.unitValue / 1000).toFixed(4).replace('.', ',') : part.unitValue.toFixed(2).replace('.', ',')}
+                                         Bruto: <strong className="text-zinc-200">R$ {previewGross.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</strong>
                                        </span>
+                                       {previewDisc > 0 && (
+                                         <span className="text-emerald-400 font-bold">
+                                           Desc: -R$ {previewDisc.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                         </span>
+                                       )}
                                        <span className="text-green-400 font-black">
-                                         Novo Subtotal: R$ {previewTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                         Subtotal Final: R$ {previewNet.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                        </span>
                                      </div>
                                    );
@@ -11380,7 +11670,11 @@ const App: React.FC = () => {
                             itemId: chosenId,
                             quantity: 1,
                             measureMode: isFluid ? 'ml' : 'standard',
-                            mlQuantity: 500
+                            mlQuantity: 500,
+                            discountType: 'fixed',
+                            discountValue: 0,
+                            discountPercentage: 0,
+                            discountReason: ''
                           });
                         }}
                       >
@@ -11615,13 +11909,128 @@ const App: React.FC = () => {
                                 )}
 
                                 <div className="p-2.5 bg-black/60 border border-zinc-800 rounded-xl flex justify-between items-center text-xs font-black">
-                                  <span className="text-zinc-400 text-[8px] uppercase">Total da Peça na O.S.:</span>
-                                  <span className="text-green-500 font-mono text-sm">
+                                  <span className="text-zinc-400 text-[8px] uppercase">Valor Bruto da Peça:</span>
+                                  <span className="text-zinc-200 font-mono text-sm">
                                     R$ {stdTotalCalculated.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                                   </span>
                                 </div>
                               </div>
                             )}
+
+                            {/* DESCONTO CUSTOMIZADO NA PEÇA AO LANÇAR NA O.S. */}
+                            {(() => {
+                              const grossForItem = isMlMode ? mlTotalCalculated : stdTotalCalculated;
+                              const isPctDisc = osPartFormData.discountType === 'percentage';
+                              const rawDiscVal = isPctDisc ? (osPartFormData.discountPercentage || 0) : (osPartFormData.discountValue || 0);
+                              const computedPartDisc = isPctDisc
+                                ? Math.round(((grossForItem * Math.min(100, Math.max(0, rawDiscVal))) / 100) * 100) / 100
+                                : Math.min(grossForItem, Math.max(0, Math.round(rawDiscVal * 100) / 100));
+                              const computedPartPct = grossForItem > 0 && computedPartDisc > 0
+                                ? Math.round((computedPartDisc / grossForItem) * 1000) / 10
+                                : 0;
+                              const finalNetForItem = Math.max(0, Math.round((grossForItem - computedPartDisc) * 100) / 100);
+
+                              return (
+                                <div className={`p-3.5 rounded-2xl border transition-all space-y-2.5 ${
+                                  computedPartDisc > 0
+                                    ? 'bg-emerald-950/30 border-emerald-500/60 shadow-[0_0_15px_rgba(16,185,129,0.12)]'
+                                    : 'bg-zinc-950/80 border-zinc-800'
+                                }`}>
+                                  <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <span className="text-[8.5px] font-black uppercase text-emerald-400 tracking-wider flex items-center gap-1.5">
+                                      <Tag size={12} /> Desconto nesta Peça (Opcional)
+                                    </span>
+                                    <div className="flex items-center gap-1 bg-black p-1 rounded-lg border border-zinc-800">
+                                      <button
+                                        type="button"
+                                        onClick={() => setOsPartFormData({ ...osPartFormData, discountType: 'fixed', discountPercentage: 0 })}
+                                        className={`px-2.5 py-1 rounded text-[8px] font-black uppercase transition-all ${
+                                          !isPctDisc ? 'bg-emerald-500 text-black' : 'text-zinc-400 hover:text-white'
+                                        }`}
+                                      >
+                                        R$ Valor (Fixo)
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setOsPartFormData({ ...osPartFormData, discountType: 'percentage', discountValue: 0 })}
+                                        className={`px-2.5 py-1 rounded text-[8px] font-black uppercase transition-all ${
+                                          isPctDisc ? 'bg-emerald-500 text-black' : 'text-zinc-400 hover:text-white'
+                                        }`}
+                                      >
+                                        % Porcentagem
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                                    <div>
+                                      <label className="text-[7.5px] font-black uppercase text-zinc-500 block mb-1">
+                                        {isPctDisc ? 'Desconto em Porcentagem (%)' : 'Valor do Desconto em R$ (quanto desejar)'}
+                                      </label>
+                                      <div className="flex items-center gap-1.5">
+                                        <div className="relative flex-1">
+                                          <input
+                                            type="number"
+                                            min="0"
+                                            max={isPctDisc ? 100 : grossForItem}
+                                            step="0.01"
+                                            placeholder={isPctDisc ? 'Ex: 10' : 'Ex: 20,00'}
+                                            value={(isPctDisc ? osPartFormData.discountPercentage : osPartFormData.discountValue) || ''}
+                                            onChange={e => {
+                                              const v = Math.max(0, parseFloat(e.target.value) || 0);
+                                              if (isPctDisc) {
+                                                setOsPartFormData({ ...osPartFormData, discountPercentage: v });
+                                              } else {
+                                                setOsPartFormData({ ...osPartFormData, discountValue: v });
+                                              }
+                                            }}
+                                            className="w-full bg-black border border-emerald-500/40 focus:border-emerald-400 p-2.5 pr-10 rounded-xl text-emerald-400 font-mono font-black text-xs outline-none"
+                                          />
+                                          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[9px] font-mono font-black text-emerald-500">
+                                            {isPctDisc ? '%' : 'R$'}
+                                          </span>
+                                        </div>
+                                        {computedPartDisc > 0 && (
+                                          <button
+                                            type="button"
+                                            onClick={() => setOsPartFormData({ ...osPartFormData, discountValue: 0, discountPercentage: 0, discountReason: '' })}
+                                            className="px-2.5 py-2.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-400 hover:text-red-400 rounded-xl text-[8px] font-black uppercase"
+                                            title="Zerar desconto"
+                                          >
+                                            Zerar
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+
+                                    <div>
+                                      <label className="text-[7.5px] font-black uppercase text-zinc-500 block mb-1">
+                                        Observação / Motivo do Desconto (Opcional)
+                                      </label>
+                                      <input
+                                        type="text"
+                                        placeholder="Ex: Cortesia / Negociação cliente"
+                                        value={osPartFormData.discountReason}
+                                        onChange={e => setOsPartFormData({ ...osPartFormData, discountReason: e.target.value })}
+                                        className="w-full bg-black border border-zinc-800 focus:border-emerald-500 p-2.5 rounded-xl text-zinc-200 text-[10px] outline-none"
+                                      />
+                                    </div>
+                                  </div>
+
+                                  <div className="p-2.5 bg-black/80 border border-zinc-800 rounded-xl flex flex-wrap items-center justify-between gap-2 text-[9.5px] font-mono">
+                                    <span className="text-zinc-400">
+                                      Original: <strong className="text-zinc-200">R$ {grossForItem.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</strong>
+                                    </span>
+                                    <span className={computedPartDisc > 0 ? 'text-emerald-400 font-bold' : 'text-zinc-500'}>
+                                      Desconto{computedPartDisc > 0 ? ` (${computedPartPct}%)` : ''}: - R$ {computedPartDisc.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                    </span>
+                                    <span className="text-green-400 font-black text-xs">
+                                      Valor Final na O.S.: R$ {finalNetForItem.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                    </span>
+                                  </div>
+                                </div>
+                              );
+                            })()}
 
                             {/* SELETOR DIRETO: VINCULAR A UMA MÃO DE OBRA JÁ EXISTENTE NESTA PRÓPRIA O.S. */}
                             {selectedOS.laborItems.length > 0 && (
@@ -12357,6 +12766,8 @@ const App: React.FC = () => {
                     </h4>
                  </div>
                  {(() => {
+                   const grossParts = selectedOS.parts.reduce((acc, p) => acc + getPartOriginalValue(p), 0);
+                   const partsSavings = selectedOS.parts.reduce((acc, p) => acc + getPartDiscountAmount(p), 0);
                    const totalParts = selectedOS.parts.reduce((acc, p) => acc + getPartFinalValue(p), 0);
                    const grossLabor = selectedOS.laborItems.reduce((acc, l) => acc + getLaborOriginalValue(l), 0);
                    const netLabor = selectedOS.laborItems.reduce((acc, l) => acc + getLaborFinalValue(l), 0);
@@ -12367,32 +12778,54 @@ const App: React.FC = () => {
                      <div className="space-y-4">
                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                           <div className="bg-black p-4 rounded-xl border border-zinc-800">
-                             <p className="text-[8px] font-black uppercase text-zinc-500 mb-1">Total Peças</p>
-                             <p className="text-xl font-black text-white font-mono">R$ {totalParts.toLocaleString('pt-BR')}</p>
+                             <div className="flex justify-between items-center mb-1">
+                               <p className="text-[8px] font-black uppercase text-zinc-500">Total Peças</p>
+                               {partsSavings > 0 && (
+                                 <span className="text-[7.5px] font-black text-emerald-400 uppercase">
+                                   Desc: -R$ {partsSavings.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                                 </span>
+                               )}
+                             </div>
+                             {partsSavings > 0 && (
+                               <p className="text-[10px] text-zinc-500 line-through font-mono">
+                                 R$ {grossParts.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                               </p>
+                             )}
+                             <p className="text-xl font-black text-white font-mono">R$ {totalParts.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
                           </div>
                           <div className="bg-black p-4 rounded-xl border border-zinc-800">
                              <div className="flex justify-between items-center mb-1">
                                <p className="text-[8px] font-black uppercase text-zinc-500">Mão de Obra</p>
                                {laborSavings > 0 && (
                                  <span className="text-[7.5px] font-black text-amber-400 uppercase">
-                                   Desc: -R$ {laborSavings.toLocaleString('pt-BR')}
+                                   Desc: -R$ {laborSavings.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
                                  </span>
                                )}
                              </div>
-                             <p className="text-xl font-black text-white font-mono">R$ {netLabor.toLocaleString('pt-BR')}</p>
+                             <p className="text-xl font-black text-white font-mono">R$ {netLabor.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
                           </div>
                           <div className="bg-green-500 p-4 rounded-xl shadow-glow">
                              <p className="text-[8px] font-black uppercase text-black mb-1">Total Geral da O.S.</p>
-                             <p className="text-2xl font-black text-black font-mono">R$ {totalOS.toLocaleString('pt-BR')}</p>
+                             <p className="text-2xl font-black text-black font-mono">R$ {totalOS.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</p>
                           </div>
                        </div>
+                       {partsSavings > 0 && (
+                         <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl flex items-center justify-between text-emerald-400">
+                           <span className="text-[9px] font-black uppercase tracking-wider flex items-center gap-1.5">
+                             🏷️ Descontos Aplicados em Peças e Insumos:
+                           </span>
+                           <span className="text-xs font-mono font-black">
+                             - R$ {partsSavings.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
+                           </span>
+                         </div>
+                       )}
                        {laborSavings > 0 && (
                          <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between text-amber-400">
                            <span className="text-[9px] font-black uppercase tracking-wider flex items-center gap-1.5">
                              🔗 Economia Aplicada por M.O. Compartilhada:
                            </span>
                            <span className="text-xs font-mono font-black">
-                             - R$ {laborSavings.toLocaleString('pt-BR')}
+                             - R$ {laborSavings.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}
                            </span>
                          </div>
                        )}

@@ -128,6 +128,11 @@ export interface OSPart {
   measureMode?: 'standard' | 'ml';
   mlQuantity?: number;
   totalValue?: number;
+  originalTotal?: number; // Valor bruto original (qtd x valor unitário) antes do desconto
+  discountType?: 'fixed' | 'percentage'; // Tipo de desconto aplicado na peça
+  discountValue?: number; // Desconto aplicado em R$ no subtotal da peça
+  discountPercentage?: number; // Percentual de desconto aplicado (%)
+  discountReason?: string; // Motivo ou observação do desconto na peça
   linkedLaborId?: string; // ID da mão de obra associada a esta peça na OS
   linkedLaborDescription?: string; // Descrição da mão de obra vinculada
   stockDeducted?: boolean; // Indica se esta peça específica já teve baixa no estoque físico
@@ -298,6 +303,9 @@ export interface Transaction {
   recipientName: string;
   notes?: string;
   unitValue?: number;
+  originalUnitValue?: number;
+  discountValue?: number;
+  discountPercentage?: number;
   destination?: MovementDestination;
   osNumber?: string;
   tenantId?: string;
