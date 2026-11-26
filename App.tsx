@@ -2397,6 +2397,26 @@ const App: React.FC = () => {
     }
   };
 
+  const isItemLiterUnit = (item?: Pick<InventoryItem, 'unit' | 'category' | 'name'> | null): boolean => {
+    if (!item) return false;
+    const u = (item.unit || '').trim().toLowerCase();
+    // Respeita explicitamente a unidade cadastrada: apenas Litro ('L', 'litro', 'litros') ativa o fracionamento automático 1L = 1000ML
+    if (u) {
+      return ['l', 'litro', 'litros'].includes(u);
+    }
+    const n = (item.name || '').toLowerCase();
+    return (
+      item.category === ItemCategory.INSUMOS ||
+      n.includes('óleo') ||
+      n.includes('oleo') ||
+      n.includes('fluido') ||
+      n.includes('fluid') ||
+      n.includes('líquido') ||
+      n.includes('lubrificante') ||
+      n.includes('xps')
+    );
+  };
+
   const buildPartTransactionMeta = (part: OSPart, qtyForTx: number) => {
     const fullQty = Number(part.quantity) || 0;
     const grossUnit = Number(part.unitValue) || 0;
@@ -3136,7 +3156,7 @@ const App: React.FC = () => {
     const os = serviceOrders.find(o => o.id === osId);
     if (!os) return;
 
-    const isMl = osPartFormData.measureMode === 'ml';
+    const isMl = osPartFormData.measureMode === 'ml' && isItemLiterUnit(item);
     let calculatedQty: number;
     let grossTotalValue: number;
     let mlValue: number | undefined = undefined;
@@ -3207,7 +3227,7 @@ const App: React.FC = () => {
       partNumber: item.partNumber,
       quantity: calculatedQty,
       unitValue: item.value,
-      unit: item.unit || 'un',
+      unit: (item.unit || 'un').trim() || 'un',
       measureMode: isMl ? 'ml' : 'standard',
       mlQuantity: mlValue,
       originalTotal: grossTotalValue,
@@ -4202,7 +4222,7 @@ const App: React.FC = () => {
     const newItem: InventoryItem = { 
       id: generateId(), 
       ...formData, 
-      unit: formData.unit || 'un',
+      unit: (formData.unit || 'un').trim() || 'un',
       entryDate: new Date().toISOString(),
       tenantId: currentTenant.id
     };
@@ -4489,6 +4509,7 @@ const App: React.FC = () => {
       return;
     }
 
+    const normalizedUnit = (editingItem.unit || 'un').trim() || 'un';
     const updatedItem: InventoryItem = {
       ...editingItem,
       name: editingItem.name.trim(),
@@ -4496,7 +4517,7 @@ const App: React.FC = () => {
       value: Number(editingItem.value) || 0,
       quantity: Number(editingItem.quantity) || 0,
       minQuantity: Number(editingItem.minQuantity) || 0,
-      unit: editingItem.unit || 'un',
+      unit: normalizedUnit,
       boxNumber: editingItem.boxNumber.trim(),
       sectionId: editingItem.sectionId || undefined,
       category: editingItem.category,
@@ -4509,6 +4530,44 @@ const App: React.FC = () => {
     setItems(prev => prev.map(i => i.id === updatedItem.id ? updatedItem : i));
     if (selectedItem?.id === updatedItem.id) {
       setSelectedItem(updatedItem);
+    }
+
+    if (osPartFormData.itemId === updatedItem.id && !isItemLiterUnit(updatedItem) && osPartFormData.measureMode === 'ml') {
+      setOsPartFormData(prev => ({ ...prev, measureMode: 'standard' }));
+    }
+
+    // Propaga a unidade de medida atualizada para O.S. em aberto cujas peças ainda não tiveram baixa de estoque
+    const osIdsToSync: ServiceOrder[] = [];
+    const syncOpenOsPartUnit = (os: ServiceOrder): ServiceOrder => {
+      if (os.status === OSStatus.COMPLETED || os.stockDeducted) return os;
+      let changed = false;
+      const nextParts = os.parts.map(p => {
+        if (p.itemId === updatedItem.id && !p.stockDeducted && p.measureMode !== 'ml' && !p.mlQuantity && p.unit !== normalizedUnit) {
+          changed = true;
+          return { ...p, unit: normalizedUnit };
+        }
+        return p;
+      });
+      if (!changed) return os;
+      const nextOs = { ...os, parts: nextParts, updatedAt: new Date().toISOString() };
+      osIdsToSync.push(nextOs);
+      return nextOs;
+    };
+
+    setServiceOrders(prev => prev.map(syncOpenOsPartUnit));
+    if (selectedOS) {
+      setSelectedOS(prev => {
+        if (!prev || prev.status === OSStatus.COMPLETED || prev.stockDeducted) return prev;
+        let changed = false;
+        const nextParts = prev.parts.map(p => {
+          if (p.itemId === updatedItem.id && !p.stockDeducted && p.measureMode !== 'ml' && !p.mlQuantity && p.unit !== normalizedUnit) {
+            changed = true;
+            return { ...p, unit: normalizedUnit };
+          }
+          return p;
+        });
+        return changed ? { ...prev, parts: nextParts, updatedAt: new Date().toISOString() } : prev;
+      });
     }
 
     // Atualiza o vínculo bidirecional em laborTemplates
@@ -4538,7 +4597,10 @@ const App: React.FC = () => {
 
     if (supabaseService.isAvailable()) {
       try {
-        await supabaseService.saveItem(updatedItem);
+        await Promise.all([
+          supabaseService.saveItem(updatedItem),
+          ...osIdsToSync.map(osObj => supabaseService.saveServiceOrder(osObj))
+        ]);
         showAlert("Sucesso", "Cadastro da peça atualizado com sucesso no Supabase!", "success");
       } catch (err: any) {
         console.error("Erro ao salvar edição de item no Supabase", err);
@@ -11274,8 +11336,10 @@ const App: React.FC = () => {
                           ? Math.round((partDisc / partOrig) * 1000) / 10
                           : (part.discountPercentage || 0);
                         const isEditingThisPart = editingOSPartIdx === idx;
-                        const unitLabel = part.unit || matchedItem?.unit || 'un';
                         const isPartMl = Boolean(part.measureMode === 'ml' || part.mlQuantity);
+                        const unitLabel = (!part.stockDeducted && !selectedOS.stockDeducted && !isPartMl && matchedItem?.unit)
+                          ? matchedItem.unit
+                          : (part.unit || matchedItem?.unit || 'un');
 
                         return (
                           <div key={idx} className={`p-4 bg-black rounded-xl border ${isEditingThisPart ? 'border-green-500 shadow-[0_0_20px_rgba(34,197,94,0.15)]' : 'border-zinc-800 hover:border-zinc-700'} space-y-2.5 transition-all`}>
@@ -11649,16 +11713,6 @@ const App: React.FC = () => {
                         onChange={e => {
                           const chosenId = e.target.value;
                           const chosenItem = items.find(i => i.id === chosenId);
-                          const isFluid = Boolean(
-                            chosenItem && (
-                              (chosenItem.unit && ['l', 'litro', 'litros', 'ml'].includes(chosenItem.unit.toLowerCase())) ||
-                              chosenItem.category === ItemCategory.INSUMOS ||
-                              (chosenItem.name || '').toLowerCase().includes('óleo') ||
-                              (chosenItem.name || '').toLowerCase().includes('oleo') ||
-                              (chosenItem.name || '').toLowerCase().includes('fluido') ||
-                              (chosenItem.name || '').toLowerCase().includes('xps')
-                            )
-                          );
                           const tiedTemplate = chosenItem ? findLaborTemplateForPart(chosenItem, laborTemplates) : null;
                           setIsQuickBindingCatalogInOS(false);
                           setOsPartSharedLaborId('');
@@ -11669,7 +11723,7 @@ const App: React.FC = () => {
                           setOsPartFormData({
                             itemId: chosenId,
                             quantity: 1,
-                            measureMode: isFluid ? 'ml' : 'standard',
+                            measureMode: 'standard',
                             mlQuantity: 500,
                             discountType: 'fixed',
                             discountValue: 0,
@@ -11687,15 +11741,16 @@ const App: React.FC = () => {
                          </option>
                          {filteredOsPartItems.map(i => {
                            const tiedLabor = findLaborTemplateForPart(i, laborTemplates);
+                           const itemUnitUpper = ((i.unit || 'un').trim() || 'un').toUpperCase();
                            return (
                              <option key={i.id} value={i.id}>
-                               {i.name.toUpperCase()} (PN: {i.partNumber || 'S/N'}) {tiedLabor ? `⚡ [M.O.: ${tiedLabor.description.toUpperCase()}]` : ''} - SALDO: {i.quantity} {(i.unit || 'UN').toUpperCase()} - R$ {i.value.toFixed(2).replace('.', ',')}
+                               {i.name.toUpperCase()} (PN: {i.partNumber || 'S/N'}) {tiedLabor ? `⚡ [M.O.: ${tiedLabor.description.toUpperCase()}]` : ''} - SALDO: {i.quantity} {itemUnitUpper} - R$ {i.value.toFixed(2).replace('.', ',')} / {itemUnitUpper}
                              </option>
                            );
                          })}
                       </select>
 
-                      {/* PAINEL DINÂMICO DE VINCULAÇÃO: LITRO vs ML COM CÁLCULO PROPORCIONAL */}
+                      {/* PAINEL DINÂMICO DE VINCULAÇÃO COM UNIDADE DO CADASTRO (E FRACIONAMENTO EM ML PARA LITRO) */}
                       {(() => {
                         const selectedItemToLink = items.find(i => i.id === osPartFormData.itemId);
                         if (!selectedItemToLink) {
@@ -11706,21 +11761,10 @@ const App: React.FC = () => {
                           );
                         }
 
-                        const isFluidOrLiter = Boolean(
-                          (selectedItemToLink.unit && ['l', 'litro', 'litros', 'ml'].includes(selectedItemToLink.unit.toLowerCase())) ||
-                          selectedItemToLink.category === ItemCategory.INSUMOS ||
-                          (selectedItemToLink.name || '').toLowerCase().includes('óleo') ||
-                          (selectedItemToLink.name || '').toLowerCase().includes('oleo') ||
-                          (selectedItemToLink.name || '').toLowerCase().includes('fluido') ||
-                          (selectedItemToLink.name || '').toLowerCase().includes('fluid') ||
-                          (selectedItemToLink.name || '').toLowerCase().includes('líquido') ||
-                          (selectedItemToLink.name || '').toLowerCase().includes('lubrificante') ||
-                          (selectedItemToLink.name || '').toLowerCase().includes('xps')
-                        );
-
-                        const isMlMode = osPartFormData.measureMode === 'ml';
+                        const isFluidOrLiter = isItemLiterUnit(selectedItemToLink);
+                        const isMlMode = isFluidOrLiter && osPartFormData.measureMode === 'ml';
                         const unitPrice = selectedItemToLink.value || 0;
-                        const currentUnit = selectedItemToLink.unit || 'un';
+                        const currentUnit = (selectedItemToLink.unit || 'un').trim() || 'un';
 
                         // Cálculos em tempo real
                         const mlUsed = osPartFormData.mlQuantity || 0;
@@ -11748,46 +11792,56 @@ const App: React.FC = () => {
                               </div>
                             </div>
 
-                            {/* Seletor do Modo de Lançamento (Litro vs Fracionado em ML) */}
-                            <div className="space-y-1.5">
+                            {/* Seletor do Modo de Lançamento (exibido apenas quando a peça está cadastrada em Litro, ou badge da unidade) */}
+                            {isFluidOrLiter ? (
+                              <div className="space-y-1.5">
+                                <div className="flex justify-between items-center">
+                                  <span className="text-[8px] font-black uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
+                                    <Droplet size={11} className="text-cyan-400" />
+                                    Modo de Lançamento na O.S.:
+                                  </span>
+                                  <span className="text-[7.5px] font-black uppercase px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                                    Unidade: {currentUnit.toUpperCase()} (Fracionável em ML)
+                                  </span>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-2 bg-zinc-950 p-1 rounded-xl border border-zinc-800">
+                                  <button
+                                    type="button"
+                                    onClick={() => setOsPartFormData({ ...osPartFormData, measureMode: 'standard' })}
+                                    className={`py-2 px-3 rounded-lg text-[9px] font-black uppercase flex items-center justify-center gap-1.5 transition-all ${
+                                      !isMlMode
+                                        ? 'bg-zinc-800 text-white shadow font-black border border-zinc-700'
+                                        : 'text-zinc-500 hover:text-zinc-300'
+                                    }`}
+                                  >
+                                    <span>🥛 Lançar em {currentUnit.toUpperCase()}</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setOsPartFormData({ ...osPartFormData, measureMode: 'ml' })}
+                                    className={`py-2 px-3 rounded-lg text-[9px] font-black uppercase flex items-center justify-center gap-1.5 transition-all ${
+                                      isMlMode
+                                        ? 'bg-cyan-500 text-black shadow-glow font-black'
+                                        : 'text-zinc-500 hover:text-cyan-400'
+                                    }`}
+                                  >
+                                    <Droplet size={12} />
+                                    <span>💧 Fracionado em ML</span>
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
                               <div className="flex justify-between items-center">
                                 <span className="text-[8px] font-black uppercase tracking-wider text-zinc-400 flex items-center gap-1.5">
-                                  <Droplet size={11} className={isFluidOrLiter ? "text-cyan-400" : "text-zinc-500"} />
-                                  Modo de Lançamento na O.S.:
+                                  <Package size={11} className="text-green-500" />
+                                  Unidade de Lançamento na O.S.:
                                 </span>
-                                {isFluidOrLiter && (
-                                  <span className="text-[7.5px] font-black uppercase px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-                                    Óleo / Fluido Detectado
-                                  </span>
-                                )}
+                                <span className="text-[8px] font-black uppercase px-2.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 font-mono">
+                                  {currentUnit.toUpperCase()}
+                                </span>
                               </div>
-
-                              <div className="grid grid-cols-2 gap-2 bg-zinc-950 p-1 rounded-xl border border-zinc-800">
-                                <button
-                                  type="button"
-                                  onClick={() => setOsPartFormData({ ...osPartFormData, measureMode: 'standard' })}
-                                  className={`py-2 px-3 rounded-lg text-[9px] font-black uppercase flex items-center justify-center gap-1.5 transition-all ${
-                                    !isMlMode
-                                      ? 'bg-zinc-800 text-white shadow font-black border border-zinc-700'
-                                      : 'text-zinc-500 hover:text-zinc-300'
-                                  }`}
-                                >
-                                  <span>{isFluidOrLiter ? '🥛 Lançar por Litro (L)' : `📦 Padrão (${currentUnit})`}</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => setOsPartFormData({ ...osPartFormData, measureMode: 'ml' })}
-                                  className={`py-2 px-3 rounded-lg text-[9px] font-black uppercase flex items-center justify-center gap-1.5 transition-all ${
-                                    isMlMode
-                                      ? 'bg-cyan-500 text-black shadow-glow font-black'
-                                      : 'text-zinc-500 hover:text-cyan-400'
-                                  }`}
-                                >
-                                  <Droplet size={12} />
-                                  <span>💧 Fracionado em ML</span>
-                                </button>
-                              </div>
-                            </div>
+                            )}
 
                             {/* Conteúdo específico por modo */}
                             {isMlMode ? (
@@ -13463,6 +13517,7 @@ const App: React.FC = () => {
 
                {/* SELEÇÃO E FILTRO DE UNIDADE DE MEDIDA */}
                <UnitOfMeasureSelector 
+                 key={editingItem.id}
                  value={editingItem.unit || 'un'} 
                  onChange={u => setEditingItem({ ...editingItem, unit: u })} 
                  itemNameHint={editingItem.name} 

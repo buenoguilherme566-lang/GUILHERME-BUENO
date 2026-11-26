@@ -248,9 +248,10 @@ const upsertBatchResilient = async (
           ? payload.map(({ email, avatarUrl, password, tenantId, ...rest }: any) => rest)
           : (({ email, avatarUrl, password, tenantId, ...rest }: any) => rest)(payload);
       } else if (tableName === 'items') {
+        const missingUnit = errMsg.includes("'unit'");
         payload = Array.isArray(payload)
-          ? payload.map(({ purchaseHistory, linkedQRCode, observations, imageUrl, unit, entryDate, description, tenantId, ...rest }: any) => rest)
-          : (({ purchaseHistory, linkedQRCode, observations, imageUrl, unit, entryDate, description, tenantId, ...rest }: any) => rest)(payload);
+          ? payload.map(({ purchaseHistory, linkedQRCode, observations, imageUrl, entryDate, description, tenantId, unit, ...rest }: any) => (missingUnit ? rest : { ...rest, unit }))
+          : (({ purchaseHistory, linkedQRCode, observations, imageUrl, entryDate, description, tenantId, unit, ...rest }: any) => (missingUnit ? rest : { ...rest, unit }))(payload);
       } else if (tableName === 'service_orders') {
         payload = Array.isArray(payload)
           ? payload.map(({ mechanicName, mechanicId, clientId, vehicleId, stockDeducted, completedAt, completedBy, notes, passportId, tenantId, ...rest }: any) => rest)
