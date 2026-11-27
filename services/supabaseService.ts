@@ -472,7 +472,9 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT,
     "avatarUrl" TEXT,
     password TEXT,
-    "tenantId" TEXT DEFAULT 'tenant_matriz_hps'
+    "tenantId" TEXT DEFAULT 'tenant_matriz_hps',
+    "authUserId" UUID,
+    "authEmail" TEXT
 );
 
 CREATE TABLE IF NOT EXISTS items (
@@ -576,7 +578,9 @@ CREATE TABLE IF NOT EXISTS clients (
     "isAccessActive" BOOLEAN DEFAULT true,
     vehicles JSONB DEFAULT '[]'::jsonb,
     "createdAt" TEXT NOT NULL,
-    "tenantId" TEXT DEFAULT 'tenant_matriz_hps'
+    "tenantId" TEXT DEFAULT 'tenant_matriz_hps',
+    "authUserId" UUID,
+    "authEmail" TEXT
 );
 
 CREATE TABLE IF NOT EXISTS client_mirror_access_logs (
@@ -646,6 +650,8 @@ ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "avatarUrl" TEXT;
 ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS password TEXT;
 ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "tenantId" TEXT DEFAULT 'tenant_matriz_hps';
+ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "authUserId" UUID;
+ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "authEmail" TEXT;
 
 ALTER TABLE IF EXISTS items ADD COLUMN IF NOT EXISTS quantity NUMERIC DEFAULT 0;
 ALTER TABLE IF EXISTS items ADD COLUMN IF NOT EXISTS "minQuantity" NUMERIC DEFAULT 0;
@@ -709,6 +715,8 @@ ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS password TEXT;
 ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "isAccessActive" BOOLEAN DEFAULT true;
 ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS vehicles JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "tenantId" TEXT DEFAULT 'tenant_matriz_hps';
+ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "authUserId" UUID;
+ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "authEmail" TEXT;
 
 ALTER TABLE IF EXISTS vehicle_sections ADD COLUMN IF NOT EXISTS "tenantId" TEXT DEFAULT 'tenant_matriz_hps';
 
@@ -770,12 +778,15 @@ CREATE INDEX IF NOT EXISTS idx_clients_tenant ON clients("tenantId");
 CREATE INDEX IF NOT EXISTS idx_clients_username ON clients(username);
 CREATE INDEX IF NOT EXISTS idx_utv_passports_tenant ON utv_passports("tenantId");
 CREATE INDEX IF NOT EXISTS idx_client_mirror_logs_client ON client_mirror_access_logs("clientId");
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_auth_user_id ON users("authUserId") WHERE "authUserId" IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_auth_user_id ON clients("authUserId") WHERE "authUserId" IS NOT NULL;
 
 -- 6. Segurança de Senha + RPCs de Autenticação (Equipe e Espelho do Cliente)
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
+REVOKE SELECT ON users FROM anon, authenticated;
 REVOKE SELECT (password) ON users FROM anon, authenticated;
-GRANT SELECT (id, username, name, role, email, "avatarUrl", "tenantId"), INSERT, UPDATE, DELETE ON users TO anon, authenticated;
+GRANT SELECT (id, username, name, role, email, "avatarUrl", "tenantId", "authUserId", "authEmail"), INSERT, UPDATE, DELETE ON users TO anon, authenticated;
 
 CREATE OR REPLACE FUNCTION hash_user_password()
 RETURNS TRIGGER AS $$
@@ -791,6 +802,13 @@ DROP TRIGGER IF EXISTS trg_hash_password ON users;
 CREATE TRIGGER trg_hash_password
 BEFORE INSERT OR UPDATE ON users
 FOR EACH ROW EXECUTE FUNCTION hash_user_password();
+
+UPDATE users
+SET password = crypt(password, gen_salt('bf', 8))
+WHERE password IS NOT NULL
+  AND password <> ''
+  AND password NOT LIKE '$2a$%'
+  AND password NOT LIKE '$2b$%';
 
 DROP FUNCTION IF EXISTS login_user(TEXT, TEXT);
 CREATE OR REPLACE FUNCTION login_user(p_username TEXT, p_password TEXT)
@@ -828,6 +846,140 @@ AS $$
     AND COALESCE("isAccessActive", true) = true
   LIMIT 1;
 $$;
+
+DROP FUNCTION IF EXISTS get_my_app_profile();
+CREATE OR REPLACE FUNCTION get_my_app_profile()
+RETURNS TABLE (
+    "accountType" TEXT,
+    id TEXT,
+    username TEXT,
+    name TEXT,
+    role TEXT,
+    email TEXT,
+    "avatarUrl" TEXT,
+    "tenantId" TEXT,
+    "clientId" TEXT,
+    "isAccessActive" BOOLEAN
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF auth.uid() IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        'STAFF'::text,
+        u.id,
+        u.username,
+        u.name,
+        u.role,
+        u.email,
+        u."avatarUrl",
+        COALESCE(u."tenantId", 'tenant_matriz_hps'),
+        NULL::text,
+        true
+    FROM public.users u
+    WHERE u."authUserId" = auth.uid()
+    LIMIT 1;
+
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        'CLIENT'::text,
+        c.id,
+        COALESCE(c.username, c.id),
+        c.name,
+        'CLIENT'::text,
+        c.email,
+        NULL::text,
+        COALESCE(c."tenantId", 'tenant_matriz_hps'),
+        c.id,
+        COALESCE(c."isAccessActive", true)
+    FROM public.clients c
+    WHERE c."authUserId" = auth.uid()
+    LIMIT 1;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION get_my_app_profile() TO authenticated;
+
+DROP FUNCTION IF EXISTS resolve_auth_login(TEXT);
+CREATE OR REPLACE FUNCTION resolve_auth_login(p_identifier TEXT)
+RETURNS TABLE (
+    "authEmail" TEXT,
+    "accountType" TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    clean_id TEXT := LOWER(TRIM(COALESCE(p_identifier, '')));
+BEGIN
+    IF clean_id = '' THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT u."authEmail", 'STAFF'::text
+    FROM public.users u
+    WHERE u."authUserId" IS NOT NULL
+      AND u."authEmail" IS NOT NULL
+      AND (LOWER(TRIM(u.username)) = clean_id OR (clean_id LIKE '%@%' AND LOWER(TRIM(COALESCE(u.email, ''))) = clean_id))
+    LIMIT 1;
+
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT c."authEmail", 'CLIENT'::text
+    FROM public.clients c
+    WHERE c."authUserId" IS NOT NULL
+      AND c."authEmail" IS NOT NULL
+      AND COALESCE(c."isAccessActive", true) = true
+      AND (LOWER(TRIM(COALESCE(c.username, ''))) = clean_id OR (clean_id LIKE '%@%' AND LOWER(TRIM(COALESCE(c.email, ''))) = clean_id))
+    LIMIT 1;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION resolve_auth_login(TEXT) TO anon, authenticated;
+
+DROP FUNCTION IF EXISTS get_public_utv_passport_preview(TEXT);
+CREATE OR REPLACE FUNCTION get_public_utv_passport_preview(p_id_or_qr TEXT)
+RETURNS TABLE (
+    id TEXT,
+    "qrCode" TEXT,
+    "vehicleNumber" TEXT,
+    "vehicleModel" TEXT,
+    "customerName" TEXT,
+    "tenantId" TEXT,
+    "tenantName" TEXT
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT
+        p.id,
+        p."qrCode",
+        p."vehicleNumber",
+        p."vehicleModel",
+        p."customerName",
+        COALESCE(p."tenantId", 'tenant_matriz_hps'),
+        t.name
+    FROM public.utv_passports p
+    LEFT JOIN public.tenants t ON t.id = COALESCE(p."tenantId", 'tenant_matriz_hps')
+    WHERE p.id = TRIM(COALESCE(p_id_or_qr, ''))
+       OR UPPER(p."qrCode") = UPPER(TRIM(COALESCE(p_id_or_qr, '')))
+    LIMIT 1;
+$$;
+GRANT EXECUTE ON FUNCTION get_public_utv_passport_preview(TEXT) TO anon, authenticated;
 
 -- 7. Habilitar RLS e Políticas de Acesso para todas as 11 tabelas
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
@@ -897,6 +1049,409 @@ NOTIFY pgrst, 'reload schema';
 `;
   },
 
+  getStrictRlsSql(): string {
+    return `-- ============================================================================
+-- SCRIPT FASE 2: POLÍTICAS RLS RESTRITIVAS (SUPABASE AUTH + RBAC POR OFICINA)
+-- Execute SOMENTE APÓS publicar a Edge Function "manage-auth-users" e
+-- autenticar ao menos 1 vez como Administrador para vincular seu authUserId.
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.app_is_any_admin()
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.users u
+    WHERE u."authUserId" = auth.uid()
+      AND UPPER(COALESCE(u.role, '')) ~ '(STOCK|ADMIN|ESTOQ|GERENTE|MASTER|OWNER)'
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.app_is_staff_in_tenant(p_tenant_id TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.users u
+    WHERE u."authUserId" = auth.uid()
+      AND COALESCE(u."tenantId", 'tenant_matriz_hps') = COALESCE(p_tenant_id, 'tenant_matriz_hps')
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.app_is_admin_in_tenant(p_tenant_id TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT EXISTS (
+    SELECT 1 FROM public.users u
+    WHERE u."authUserId" = auth.uid()
+      AND COALESCE(u."tenantId", 'tenant_matriz_hps') = COALESCE(p_tenant_id, 'tenant_matriz_hps')
+      AND UPPER(COALESCE(u.role, '')) ~ '(STOCK|ADMIN|ESTOQ|GERENTE|MASTER|OWNER)'
+  );
+$$;
+
+CREATE OR REPLACE FUNCTION public.app_client_id_for_auth()
+RETURNS TEXT LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT c.id FROM public.clients c
+  WHERE c."authUserId" = auth.uid() AND COALESCE(c."isAccessActive", true) = true
+  LIMIT 1;
+$$;
+
+CREATE OR REPLACE FUNCTION public.app_client_tenant_for_auth()
+RETURNS TEXT LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public AS $$
+  SELECT COALESCE(c."tenantId", 'tenant_matriz_hps') FROM public.clients c
+  WHERE c."authUserId" = auth.uid() AND COALESCE(c."isAccessActive", true) = true
+  LIMIT 1;
+$$;
+
+ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de oficinas" ON tenants;
+DROP POLICY IF EXISTS "Gestão de oficinas" ON tenants;
+DROP POLICY IF EXISTS "tenants_select_auth" ON tenants;
+DROP POLICY IF EXISTS "tenants_write_admin" ON tenants;
+CREATE POLICY "tenants_select_auth" ON tenants FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant(id) OR id = public.app_client_tenant_for_auth());
+CREATE POLICY "tenants_write_admin" ON tenants FOR ALL TO authenticated USING (public.app_is_any_admin()) WITH CHECK (public.app_is_any_admin());
+
+ALTER TABLE tenant_users ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Gestão de vínculos de oficina" ON tenant_users;
+DROP POLICY IF EXISTS "tenant_users_select_auth" ON tenant_users;
+DROP POLICY IF EXISTS "tenant_users_write_admin" ON tenant_users;
+CREATE POLICY "tenant_users_select_auth" ON tenant_users FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "tenant_users_write_admin" ON tenant_users FOR ALL TO authenticated USING (public.app_is_any_admin()) WITH CHECK (public.app_is_any_admin());
+
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura pública de perfis" ON users;
+DROP POLICY IF EXISTS "Inserção/Atualização restrita" ON users;
+DROP POLICY IF EXISTS "Atualização restrita" ON users;
+DROP POLICY IF EXISTS "Gestão de usuários" ON users;
+DROP POLICY IF EXISTS "users_select_staff" ON users;
+DROP POLICY IF EXISTS "users_write_admin" ON users;
+CREATE POLICY "users_select_staff" ON users FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "users_write_admin" ON users FOR ALL TO authenticated USING (public.app_is_any_admin()) WITH CHECK (public.app_is_any_admin());
+
+ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de inventário" ON items;
+DROP POLICY IF EXISTS "Modificação de inventário" ON items;
+DROP POLICY IF EXISTS "Atualização de inventário" ON items;
+DROP POLICY IF EXISTS "Gestão de inventário" ON items;
+DROP POLICY IF EXISTS "Gestão de estoque" ON items;
+DROP POLICY IF EXISTS "items_select_auth" ON items;
+DROP POLICY IF EXISTS "items_insert_staff" ON items;
+DROP POLICY IF EXISTS "items_update_staff" ON items;
+DROP POLICY IF EXISTS "items_delete_admin" ON items;
+CREATE POLICY "items_select_auth" ON items FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId") OR "tenantId" = public.app_client_tenant_for_auth());
+CREATE POLICY "items_insert_staff" ON items FOR INSERT TO authenticated WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "items_update_staff" ON items FOR UPDATE TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId")) WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "items_delete_admin" ON items FOR DELETE TO authenticated USING (public.app_is_any_admin());
+
+ALTER TABLE history ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de logs" ON history;
+DROP POLICY IF EXISTS "Inserção de logs" ON history;
+DROP POLICY IF EXISTS "Gestão de logs" ON history;
+DROP POLICY IF EXISTS "Gestão de histórico" ON history;
+DROP POLICY IF EXISTS "history_select_staff" ON history;
+DROP POLICY IF EXISTS "history_insert_staff" ON history;
+DROP POLICY IF EXISTS "history_admin_manage" ON history;
+DROP POLICY IF EXISTS "history_admin_delete" ON history;
+CREATE POLICY "history_select_staff" ON history FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "history_insert_staff" ON history FOR INSERT TO authenticated WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "history_admin_manage" ON history FOR UPDATE TO authenticated USING (public.app_is_any_admin()) WITH CHECK (public.app_is_any_admin());
+CREATE POLICY "history_admin_delete" ON history FOR DELETE TO authenticated USING (public.app_is_any_admin());
+
+ALTER TABLE service_orders ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de OS" ON service_orders;
+DROP POLICY IF EXISTS "Gestão de OS" ON service_orders;
+DROP POLICY IF EXISTS "Atualização de OS" ON service_orders;
+DROP POLICY IF EXISTS "Gestão de ordens de serviço" ON service_orders;
+DROP POLICY IF EXISTS "os_select_staff" ON service_orders;
+DROP POLICY IF EXISTS "os_insert_staff" ON service_orders;
+DROP POLICY IF EXISTS "os_update_staff" ON service_orders;
+DROP POLICY IF EXISTS "os_delete_admin" ON service_orders;
+CREATE POLICY "os_select_staff" ON service_orders FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "os_insert_staff" ON service_orders FOR INSERT TO authenticated WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "os_update_staff" ON service_orders FOR UPDATE TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId")) WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "os_delete_admin" ON service_orders FOR DELETE TO authenticated USING (public.app_is_any_admin());
+
+ALTER TABLE vehicle_sections ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de seções" ON vehicle_sections;
+DROP POLICY IF EXISTS "Gestão de seções" ON vehicle_sections;
+DROP POLICY IF EXISTS "sections_select_staff" ON vehicle_sections;
+DROP POLICY IF EXISTS "sections_write_admin" ON vehicle_sections;
+CREATE POLICY "sections_select_staff" ON vehicle_sections FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "sections_write_admin" ON vehicle_sections FOR ALL TO authenticated USING (public.app_is_any_admin()) WITH CHECK (public.app_is_any_admin());
+
+ALTER TABLE labor_templates ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de modelos" ON labor_templates;
+DROP POLICY IF EXISTS "Gestão de modelos" ON labor_templates;
+DROP POLICY IF EXISTS "labor_select_staff" ON labor_templates;
+DROP POLICY IF EXISTS "labor_write_admin" ON labor_templates;
+CREATE POLICY "labor_select_staff" ON labor_templates FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "labor_write_admin" ON labor_templates FOR ALL TO authenticated USING (public.app_is_any_admin()) WITH CHECK (public.app_is_any_admin());
+
+ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de clientes" ON clients;
+DROP POLICY IF EXISTS "Gestão de clientes" ON clients;
+DROP POLICY IF EXISTS "clients_select_auth" ON clients;
+DROP POLICY IF EXISTS "clients_insert_staff" ON clients;
+DROP POLICY IF EXISTS "clients_update_staff" ON clients;
+DROP POLICY IF EXISTS "clients_delete_admin" ON clients;
+CREATE POLICY "clients_select_auth" ON clients FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId") OR id = public.app_client_id_for_auth());
+CREATE POLICY "clients_insert_staff" ON clients FOR INSERT TO authenticated WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "clients_update_staff" ON clients FOR UPDATE TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId")) WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "clients_delete_admin" ON clients FOR DELETE TO authenticated USING (public.app_is_any_admin());
+
+ALTER TABLE client_mirror_access_logs ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Logs de acesso ao espelho" ON client_mirror_access_logs;
+DROP POLICY IF EXISTS "mirror_logs_select_staff" ON client_mirror_access_logs;
+DROP POLICY IF EXISTS "mirror_logs_insert_auth" ON client_mirror_access_logs;
+CREATE POLICY "mirror_logs_select_staff" ON client_mirror_access_logs FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "mirror_logs_insert_auth" ON client_mirror_access_logs FOR INSERT TO authenticated WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId") OR "clientId" = public.app_client_id_for_auth());
+
+ALTER TABLE utv_passports ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Leitura de passaportes UTV" ON utv_passports;
+DROP POLICY IF EXISTS "Gestão de passaportes UTV" ON utv_passports;
+DROP POLICY IF EXISTS "passports_select_auth" ON utv_passports;
+DROP POLICY IF EXISTS "passports_insert_staff" ON utv_passports;
+DROP POLICY IF EXISTS "passports_update_staff" ON utv_passports;
+DROP POLICY IF EXISTS "passports_delete_admin" ON utv_passports;
+CREATE POLICY "passports_select_auth" ON utv_passports FOR SELECT TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId") OR "clientId" = public.app_client_id_for_auth());
+CREATE POLICY "passports_insert_staff" ON utv_passports FOR INSERT TO authenticated WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "passports_update_staff" ON utv_passports FOR UPDATE TO authenticated USING (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId")) WITH CHECK (public.app_is_any_admin() OR public.app_is_staff_in_tenant("tenantId"));
+CREATE POLICY "passports_delete_admin" ON utv_passports FOR DELETE TO authenticated USING (public.app_is_any_admin());
+
+NOTIFY pgrst, 'reload schema';
+`;
+  },
+
+  // --- SUPABASE AUTH & EDGE FUNCTION ORCHESTRATION ---
+  async getSession() {
+    if (!supabase) return null;
+    try {
+      const { data, error } = await supabase.auth.getSession();
+      if (error) return null;
+      return data?.session || null;
+    } catch {
+      return null;
+    }
+  },
+  onAuthStateChange(callback: (event: string, session: any) => void) {
+    if (!supabase) return { unsubscribe: () => {} };
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      callback(event, session);
+    });
+    return data.subscription;
+  },
+  async signOut() {
+    if (!supabase) return;
+    try {
+      await supabase.auth.signOut();
+    } catch {}
+  },
+  async getAuthenticatedProfile(): Promise<User | null> {
+    if (!supabase) return null;
+    try {
+      const { data, error } = await supabase.rpc('get_my_app_profile');
+      if (error || !Array.isArray(data) || data.length === 0) return null;
+      const row = data[0];
+      if (row.accountType === 'CLIENT' || row.role === 'CLIENT') {
+        if (row.isAccessActive === false) return null;
+        return {
+          id: row.id,
+          username: row.username || row.id,
+          name: row.name,
+          role: UserRole.CLIENT,
+          email: row.email || undefined,
+          tenantId: row.tenantId || 'tenant_matriz_hps',
+          clientId: row.clientId || row.id
+        };
+      }
+      const roleRaw = String(row.role || '').toUpperCase();
+      const isAdminRole =
+        roleRaw.includes('STOCK') ||
+        roleRaw.includes('ADMIN') ||
+        roleRaw.includes('ESTOQ') ||
+        roleRaw.includes('GERENTE') ||
+        roleRaw.includes('MASTER') ||
+        roleRaw.includes('OWNER');
+      return {
+        id: row.id,
+        username: row.username,
+        name: row.name,
+        role: isAdminRole ? UserRole.STOCKIST : UserRole.MECHANIC,
+        email: row.email || undefined,
+        avatarUrl: row.avatarUrl || undefined,
+        tenantId: row.tenantId || 'tenant_matriz_hps'
+      };
+    } catch {
+      return null;
+    }
+  },
+  async getPublicPassportPreview(idOrQr: string): Promise<Partial<UTVPassport> & { tenantName?: string } | null> {
+    if (!supabase) return null;
+    const cleanVal = String(idOrQr || '').trim();
+    if (!cleanVal) return null;
+    try {
+      const { data, error } = await supabase.rpc('get_public_utv_passport_preview', { p_id_or_qr: cleanVal });
+      if (!error && Array.isArray(data) && data.length > 0) {
+        return data[0] as any;
+      }
+      if (!error && Array.isArray(data) && data.length === 0) {
+        return null;
+      }
+    } catch {}
+    return await this.getUTVPassportById(cleanVal);
+  },
+  async invokeAuthEdgeFunction(body: Record<string, unknown>): Promise<{ ok: boolean; data?: any; edgeUnavailable?: boolean; error?: string }> {
+    if (!supabase) return { ok: false, edgeUnavailable: true, error: 'Supabase não inicializado.' };
+    try {
+      const { data, error } = await supabase.functions.invoke('manage-auth-users', { body });
+      if (error) {
+        const msg = String(error.message || '');
+        const status = (error as any)?.context?.status;
+        if (
+          status === 404 ||
+          msg.includes('Failed to send a request') ||
+          msg.includes('FunctionsFetchError') ||
+          msg.includes('404')
+        ) {
+          return { ok: false, edgeUnavailable: true, error: msg };
+        }
+        let parsedError = msg;
+        try {
+          const ctxBody = await (error as any)?.context?.json?.();
+          if (ctxBody?.error) parsedError = ctxBody.error;
+        } catch {}
+        return { ok: false, error: parsedError || 'Erro na Edge Function.' };
+      }
+      if (data?.error) {
+        return { ok: false, error: String(data.error) };
+      }
+      return { ok: true, data };
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      return {
+        ok: false,
+        edgeUnavailable: msg.includes('Failed to fetch') || msg.includes('FunctionsFetchError'),
+        error: msg
+      };
+    }
+  },
+  async signInWithAuthOrMigrate(identifier: string, password: string): Promise<{
+    user: User | null;
+    authMode: 'supabase_auth' | 'legacy_rpc';
+    edgeUnavailable?: boolean;
+    error?: string;
+  }> {
+    const client = getClient();
+    const cleanId = identifier.trim().toLowerCase();
+    const slug = cleanId.replace(/[^a-z0-9._-]/g, '_');
+
+    const candidateEmails: string[] = [];
+    try {
+      const { data: resolved } = await client.rpc('resolve_auth_login', { p_identifier: cleanId });
+      if (Array.isArray(resolved) && resolved.length > 0 && resolved[0]?.authEmail) {
+        candidateEmails.push(String(resolved[0].authEmail).toLowerCase());
+      }
+    } catch {}
+
+    if (cleanId.includes('@')) {
+      if (!candidateEmails.includes(cleanId)) candidateEmails.push(cleanId);
+    } else {
+      const staffCandidate = `${slug}@staff.hps.local`;
+      const clientCandidate = `${slug}@client.hps.local`;
+      if (!candidateEmails.includes(staffCandidate)) candidateEmails.push(staffCandidate);
+      if (!candidateEmails.includes(clientCandidate)) candidateEmails.push(clientCandidate);
+    }
+
+    for (const email of candidateEmails) {
+      const { data: authRes, error: authErr } = await client.auth.signInWithPassword({ email, password });
+      if (!authErr && authRes?.session) {
+        const profile = await this.getAuthenticatedProfile();
+        if (profile) {
+          return { user: profile, authMode: 'supabase_auth' };
+        }
+      }
+    }
+
+    // Tenta auto-migração via Edge Function (para usuários legados antes do primeiro login com Supabase Auth)
+    const migRes = await this.invokeAuthEdgeFunction({
+      action: 'migrate_on_login',
+      identifier: cleanId,
+      password
+    });
+
+    if (migRes.ok && migRes.data?.authEmail) {
+      const { data: authAfterMig, error: loginAfterMigErr } = await client.auth.signInWithPassword({
+        email: String(migRes.data.authEmail),
+        password
+      });
+      if (!loginAfterMigErr && authAfterMig?.session) {
+        const profile = await this.getAuthenticatedProfile();
+        if (profile) {
+          return { user: profile, authMode: 'supabase_auth' };
+        }
+      }
+    }
+
+    return {
+      user: null,
+      authMode: 'legacy_rpc',
+      edgeUnavailable: migRes.edgeUnavailable,
+      error: migRes.error
+    };
+  },
+  async checkAuthEdgeFunctionHealth(): Promise<{ available: boolean; isAdmin?: boolean; message: string }> {
+    const res = await this.invokeAuthEdgeFunction({ action: 'health_check' });
+    if (res.ok) {
+      return { available: true, isAdmin: Boolean(res.data?.isAdmin), message: 'Edge Function manage-auth-users ativa e validada via JWT.' };
+    }
+    return {
+      available: false,
+      message: res.edgeUnavailable
+        ? 'Edge Function manage-auth-users ainda não publicada no Supabase.'
+        : (res.error || 'Sessão Supabase Auth não ativa.')
+    };
+  },
+  async adminCreateStaff(user: User): Promise<{ mode: 'auth' | 'legacy' }> {
+    const res = await this.invokeAuthEdgeFunction({ action: 'create_staff', user });
+    if (res.ok) return { mode: 'auth' };
+    if (res.edgeUnavailable) {
+      await this.saveUser(user);
+      return { mode: 'legacy' };
+    }
+    throw new Error(res.error || 'Erro ao criar funcionário.');
+  },
+  async adminResetStaffPassword(user: User, newPassword: string): Promise<{ mode: 'auth' | 'legacy' }> {
+    const res = await this.invokeAuthEdgeFunction({ action: 'reset_staff_password', userId: user.id, newPassword });
+    if (res.ok) return { mode: 'auth' };
+    if (res.edgeUnavailable) {
+      await this.saveUser({ ...user, password: newPassword });
+      return { mode: 'legacy' };
+    }
+    throw new Error(res.error || 'Erro ao redefinir senha.');
+  },
+  async adminDeleteStaff(userId: string): Promise<{ mode: 'auth' | 'legacy' }> {
+    const res = await this.invokeAuthEdgeFunction({ action: 'delete_staff', userId });
+    if (res.ok) return { mode: 'auth' };
+    if (res.edgeUnavailable) {
+      await this.deleteUser(userId);
+      return { mode: 'legacy' };
+    }
+    throw new Error(res.error || 'Erro ao excluir funcionário.');
+  },
+  async syncClientAuthAccount(clientData: Client): Promise<{ mode: 'auth' | 'legacy' }> {
+    const res = await this.invokeAuthEdgeFunction({ action: 'sync_client_auth', client: clientData });
+    if (res.ok) return { mode: 'auth' };
+    if (res.edgeUnavailable) {
+      await this.saveClient(clientData);
+      return { mode: 'legacy' };
+    }
+    throw new Error(res.error || 'Erro ao sincronizar credenciais do cliente.');
+  },
+  async adminDeleteClientAuth(clientId: string): Promise<{ mode: 'auth' | 'legacy' }> {
+    const res = await this.invokeAuthEdgeFunction({ action: 'delete_client_auth', clientId });
+    if (res.ok) return { mode: 'auth' };
+    if (res.edgeUnavailable) {
+      await this.deleteClient(clientId);
+      return { mode: 'legacy' };
+    }
+    throw new Error(res.error || 'Erro ao remover cliente.');
+  },
+
   // --- TENANTS (MULTI-TENANCY CORE) ---
   async getTenants(): Promise<Tenant[]> {
     if (missingTables.has('tenants')) return [];
@@ -949,10 +1504,22 @@ NOTIFY pgrst, 'reload schema';
   async getUsers(tenantId?: string): Promise<User[]> {
     const client = getClient();
 
-    const mapRowToUser = (u: any): User => {
-      const roleRaw = (u.role || u.funcao || u.cargo || u.perfil || u.tipo || u.tipo_acesso || u.nivel || '').toString().toUpperCase();
-      const isStockistOrAdmin = roleRaw.includes('STOCK') || roleRaw.includes('ADMIN') || roleRaw.includes('ESTOQ') || roleRaw.includes('GERENTE') || roleRaw.includes('MASTER');
+    const normalizeUserRole = (raw: any): UserRole => {
+      const roleRaw = String(raw || '').toUpperCase();
+      if (
+        roleRaw.includes('STOCK') ||
+        roleRaw.includes('ADMIN') ||
+        roleRaw.includes('ESTOQ') ||
+        roleRaw.includes('GERENTE') ||
+        roleRaw.includes('MASTER') ||
+        roleRaw.includes('OWNER')
+      ) {
+        return UserRole.STOCKIST;
+      }
+      return UserRole.MECHANIC;
+    };
 
+    const mapRowToUser = (u: any): User => {
       const idVal = String(u.id || u.username || u.login || u.cpf || u.matricula || u.email || Math.random().toString(36).substring(2, 9));
       const usernameVal = String(u.username || u.login || u.email || u.cpf || u.matricula || u.name || u.nome || idVal);
       const nameVal = String(u.name || u.nome || u.full_name || u.nome_completo || u.razao_social || usernameVal || 'Funcionário');
@@ -961,22 +1528,32 @@ NOTIFY pgrst, 'reload schema';
         id: idVal,
         username: usernameVal,
         name: nameVal,
-        role: isStockistOrAdmin ? UserRole.STOCKIST : UserRole.MECHANIC,
+        role: normalizeUserRole(u.role || u.funcao || u.cargo || u.perfil || u.tipo || u.tipo_acesso || u.nivel),
         email: u.email || u.contato || undefined,
         avatarUrl: u.avatarUrl || u.avatar_url || u.foto || undefined,
         password: u.password || u.senha || undefined,
-        tenantId: u.tenantId || u.tenant_id || undefined
+        tenantId: u.tenantId || u.tenant_id || undefined,
+        authUserId: u.authUserId || undefined,
+        authEmail: u.authEmail || undefined
       };
     };
 
     // 1. Selecionar colunas seguras explicitamente (compatível com REVOKE SELECT (password) ON users)
-    const safeColumns = 'id, username, name, role, email, "avatarUrl", "tenantId"';
+    const safeColumns = 'id, username, name, role, email, "avatarUrl", "tenantId", "authUserId", "authEmail"';
+    const legacySafeColumns = 'id, username, name, role, email, "avatarUrl", "tenantId"';
     try {
       let query = client.from('users').select(safeColumns);
       if (tenantId) {
         query = query.eq('tenantId', tenantId);
       }
-      const { data, error } = await query;
+      let { data, error } = await query;
+      if (error && (error.message?.includes('authUserId') || error.message?.includes('authEmail') || error.code === '42703' || error.code === 'PGRST204')) {
+        let retryQuery = client.from('users').select(legacySafeColumns);
+        if (tenantId) retryQuery = retryQuery.eq('tenantId', tenantId);
+        const retryRes = await retryQuery;
+        data = retryRes.data as any;
+        error = retryRes.error;
+      }
       if (!error && Array.isArray(data) && data.length > 0) {
         return data.map(mapRowToUser);
       }
@@ -1019,7 +1596,19 @@ NOTIFY pgrst, 'reload schema';
       }
       
       if (data && data.length > 0) {
-        return data[0] as User;
+        const row = data[0];
+        const roleRaw = String(row.role || '').toUpperCase();
+        const isAdminRole =
+          roleRaw.includes('STOCK') ||
+          roleRaw.includes('ADMIN') ||
+          roleRaw.includes('ESTOQ') ||
+          roleRaw.includes('GERENTE') ||
+          roleRaw.includes('MASTER') ||
+          roleRaw.includes('OWNER');
+        return {
+          ...row,
+          role: isAdminRole ? UserRole.STOCKIST : UserRole.MECHANIC,
+        } as User;
       }
       return null;
     } catch (e: any) {
@@ -1101,30 +1690,21 @@ NOTIFY pgrst, 'reload schema';
     const cleanPass = password.trim();
     if (!cleanUser || !cleanPass) return null;
 
-    // 1. Tentar via RPC (se já criado no banco)
+    // Autenticação exclusiva via RPC no Supabase (sem descarga de tabela de clientes para o navegador)
     try {
       const { data: rpcData, error: rpcErr } = await getClient().rpc('authenticate_client_mirror', {
         p_username: cleanUser,
         p_password: cleanPass
       });
-      if (!rpcErr && Array.isArray(rpcData) && rpcData.length > 0) {
+      if (rpcErr) {
+        console.warn('[Supabase] Erro RPC authenticate_client_mirror:', rpcErr.message);
+        return null;
+      }
+      if (Array.isArray(rpcData) && rpcData.length > 0) {
         return rpcData[0] as Client;
       }
-    } catch {}
-
-    // 2. Fallback para consulta direta na tabela 'clients'
-    try {
-      const { data, error } = await getClient()
-        .from('clients')
-        .select('*');
-      if (!error && Array.isArray(data)) {
-        const matched = (data as Client[]).find(
-          c => c.username && c.username.trim().toLowerCase() === cleanUser && c.password === cleanPass
-        );
-        return matched || null;
-      }
     } catch (e) {
-      console.warn('[Supabase] Erro ao autenticar cliente no banco:', e);
+      console.warn('[Supabase] Erro ao autenticar cliente via RPC:', e);
     }
     return null;
   },
@@ -1148,14 +1728,24 @@ NOTIFY pgrst, 'reload schema';
   },
   async getUTVPassportById(idOrQr: string): Promise<UTVPassport | null> {
     if (!supabase || missingTables.has('utv_passports')) return null;
+    const cleanVal = String(idOrQr || '').trim();
+    if (!cleanVal) return null;
     try {
-      const { data, error } = await getClient()
+      const byId = await getClient()
         .from('utv_passports')
         .select('*')
-        .or(`id.eq.${idOrQr},qrCode.eq.${idOrQr}`)
+        .eq('id', cleanVal)
         .maybeSingle();
-      if (!error && data) {
-        return data as UTVPassport;
+      if (!byId.error && byId.data) {
+        return byId.data as UTVPassport;
+      }
+      const byQr = await getClient()
+        .from('utv_passports')
+        .select('*')
+        .eq('qrCode', cleanVal)
+        .maybeSingle();
+      if (!byQr.error && byQr.data) {
+        return byQr.data as UTVPassport;
       }
     } catch (e) {
       console.warn('[Supabase] Erro ao consultar passaporte UTV por ID/QR:', e);

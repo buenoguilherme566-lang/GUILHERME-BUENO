@@ -103,13 +103,21 @@ export const printOSDocument = (element: HTMLElement, title = 'Ordem de Serviço
       stylesHtml += node.outerHTML;
     });
 
+    const escapeHtml = (val: string) =>
+      String(val ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+
     frameDoc.open();
     frameDoc.write(`
       <!DOCTYPE html>
       <html lang="pt-br">
         <head>
           <meta charset="utf-8">
-          <title>${title}</title>
+          <title>${escapeHtml(title)}</title>
           <script src="https://cdn.tailwindcss.com"></script>
           ${stylesHtml}
           <style>

@@ -23,6 +23,8 @@ export interface User {
   role: UserRole;
   avatarUrl?: string;
   tenantId?: string;
+  authUserId?: string;
+  authEmail?: string;
   clientId?: string; // Vinculado quando role === UserRole.CLIENT (acesso restrito ao Espelho do Cliente)
   allowedPassportId?: string; // Se o cliente acessou via link específico do espelho (?utv_passport=...)
 }
@@ -199,6 +201,8 @@ export interface Client {
   vehicles: ClientVehicle[];
   createdAt: string;
   tenantId?: string;
+  authUserId?: string;
+  authEmail?: string;
 }
 
 export interface ServiceOrder {

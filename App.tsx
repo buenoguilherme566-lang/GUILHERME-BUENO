@@ -27,7 +27,6 @@ import OSPrintDocument, { getLaborFinalValue, getLaborDiscountAmount, getLaborOr
 import UTVPassportModule from './components/UTVPassportModule';
 import UTVPassportClientMirror from './components/UTVPassportClientMirror';
 import { checkLaborRelation, computeLaborGross, findLaborTemplateForPart } from './utils/laborUtils';
-import { GoogleGenAI, Type } from "@google/genai";
 import { supabaseService } from './services/supabaseService';
 import { 
   idbGet, 
@@ -79,7 +78,8 @@ const App: React.FC = () => {
   const [serviceOrders, setServiceOrders] = useState<ServiceOrder[]>([]);
   const [vehicleSections, setVehicleSections] = useState<VehicleSection[]>([]);
   const [laborTemplates, setLaborTemplates] = useState<LaborTemplate[]>([]);
-  const [utvPassports, setUtvPassports] = useState<UTVPassport[]>(DEFAULT_UTV_PASSPORTS);
+  const [utvPassports, setUtvPassports] = useState<UTVPassport[]>([]);
+  const [publicPreviewPassport, setPublicPreviewPassport] = useState<UTVPassport | null>(null);
   const [selectedPassport, setSelectedPassport] = useState<UTVPassport | null>(null);
   const [osSubTab, setOsSubTab] = useState<'orders' | 'passports'>('orders');
   const [clientMirrorPassport, setClientMirrorPassport] = useState<UTVPassport | null>(null);
@@ -110,7 +110,9 @@ const App: React.FC = () => {
   const [userSearchTerm, setUserSearchTerm] = useState('');
   const [userRoleFilter, setUserRoleFilter] = useState<'ALL' | UserRole>('ALL');
   const [showSqlModal, setShowSqlModal] = useState(false);
+  const [sqlModalTab, setSqlModalTab] = useState<'schema' | 'rls'>('schema');
   const [copiedSql, setCopiedSql] = useState(false);
+  const [authEdgeStatus, setAuthEdgeStatus] = useState<{ available: boolean; isAdmin?: boolean; message: string } | null>(null);
 
   // --- CLIENTS STATE ---
   const [clients, setClients] = useState<Client[]>([]);
@@ -370,6 +372,22 @@ const App: React.FC = () => {
   const [confirmConfig, setConfirmConfig] = useState<{ isOpen: boolean; title: string; message: string; onConfirm: () => void; onCancel?: () => void }>({
     isOpen: false, title: '', message: '', onConfirm: () => {}, onCancel: () => {}
   });
+  const [passwordResetModal, setPasswordResetModal] = useState<{
+    isOpen: boolean;
+    userId: string | null;
+    userName: string;
+    newPassword: string;
+  }>({
+    isOpen: false,
+    userId: null,
+    userName: '',
+    newPassword: ''
+  });
+
+  // --- AUTH STATE ---
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
 
   const showAlert = (title: string, message: string, type: 'success' | 'error' | 'info' = 'info') => {
     setAlertConfig({ isOpen: true, title, message, type });
@@ -388,14 +406,213 @@ const App: React.FC = () => {
     });
   };
 
-  // --- PERSISTENCE ENGINE ---
   // --- PERSISTENCE ENGINE (MULTI-TENANT CAPABLE) ---
-  // Load DB once on mount
+  const getLocalTenantData = async (key: string, isDefault: boolean) => {
+    try {
+      const idbData = await idbGet<any>(key);
+      if (idbData && typeof idbData === 'object') {
+        return idbData;
+      }
+    } catch {}
+
+    const raw = safeGetItem(key) || (isDefault ? safeGetItem(DB_KEY) : null);
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        idbSet(key, parsed);
+        return parsed;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  // Carrega os dados operacionais da oficina SOMENTE após autenticação válida
+  const loadTenantWorkspaceData = async (activeTenant: Tenant, loggedUser: User) => {
+    const tenantStorageKey = `${DB_KEY}_${activeTenant.id}`;
+    setIsSyncing(true);
+    try {
+      const isClientSession = loggedUser.role === UserRole.CLIENT;
+
+      if (supabaseService.isAvailable()) {
+        const fetchWithFallback = async <T,>(promise: Promise<T>, fallback: T): Promise<T> => {
+          try {
+            return await promise;
+          } catch (err) {
+            console.error("Erro ao buscar dados do Supabase:", err);
+            return fallback;
+          }
+        };
+
+        if (isClientSession) {
+          // Sessão de cliente: carrega exclusivamente passaportes UTV e itens para exibição do espelho (nunca clientes, usuários, OS ou histórico)
+          const [sbPassports, sbItems] = await Promise.all([
+            fetchWithFallback(supabaseService.getUTVPassports(activeTenant.id), []),
+            fetchWithFallback(supabaseService.getItems(activeTenant.id), [])
+          ]);
+          const clientPassports = sbPassports.filter(
+            p =>
+              (loggedUser.clientId && p.clientId === loggedUser.clientId) ||
+              p.customerName.trim().toLowerCase() === loggedUser.name.trim().toLowerCase()
+          );
+          setUsers([]);
+          setClients([]);
+          setServiceOrders([]);
+          setHistory([]);
+          setLaborTemplates([]);
+          setVehicleSections([]);
+          setItems(sbItems);
+          setUtvPassports(clientPassports);
+          setSyncError(null);
+          return;
+        }
+
+        const [sbUsers, sbItems, sbHistory, sbOrders, sbSections, sbTemplates, sbClients, sbPassports] = await Promise.all([
+          fetchWithFallback(supabaseService.getUsers(activeTenant.id), []),
+          fetchWithFallback(supabaseService.getItems(activeTenant.id), []),
+          fetchWithFallback(supabaseService.getHistory(activeTenant.id), []),
+          fetchWithFallback(supabaseService.getServiceOrders(activeTenant.id), []),
+          fetchWithFallback(supabaseService.getVehicleSections(activeTenant.id), []),
+          fetchWithFallback(supabaseService.getLaborTemplates(activeTenant.id), []),
+          fetchWithFallback(supabaseService.getClients(activeTenant.id), []),
+          fetchWithFallback(supabaseService.getUTVPassports(activeTenant.id), [])
+        ]);
+
+        const localDb = await getLocalTenantData(tenantStorageKey, activeTenant.id === DEFAULT_TENANT_ID);
+
+        if (sbUsers.length || sbItems.length || sbHistory.length || sbOrders.length || sbSections.length || sbTemplates.length || sbClients.length || sbPassports.length) {
+          setUsers(sbUsers);
+
+          const baseTemplates = sbTemplates.length > 0 ? sbTemplates : (localDb?.laborTemplates && localDb.laborTemplates.length > 0 ? localDb.laborTemplates : DEFAULT_LABOR_TEMPLATES);
+          const resolvedTemplates = baseTemplates.map((t: LaborTemplate) => {
+            const localT = localDb?.laborTemplates?.find((lt: LaborTemplate) => lt.id === t.id);
+            const tLinks = Array.isArray(t.linkedItemIds)
+              ? t.linkedItemIds
+              : (typeof t.linkedItemIds === 'string' ? (() => { try { return JSON.parse(t.linkedItemIds); } catch { return []; } })() : []);
+            const lLinks = Array.isArray(localT?.linkedItemIds) ? localT.linkedItemIds : [];
+            const mergedLinks = Array.from(new Set([...tLinks, ...lLinks]));
+            const resolvedPricingType = t.pricingType || localT?.pricingType || 'hourly';
+            const resolvedMinutes = t.minutes !== undefined ? Number(t.minutes) : (localT?.minutes !== undefined ? Number(localT.minutes) : 0);
+            const rawHours = Number(t.defaultHours) > 0 ? Number(t.defaultHours) : (Number(localT?.defaultHours) > 0 ? Number(localT?.defaultHours) : 0);
+            const resolvedHours = resolvedPricingType === 'fixed' ? (rawHours || 1) : ((rawHours === 0 && resolvedMinutes === 0) ? 1 : rawHours);
+            const resolvedRate = Number(t.defaultValuePerHour) > 0
+              ? Number(t.defaultValuePerHour)
+              : (Number(localT?.defaultValuePerHour) > 0 ? Number(localT?.defaultValuePerHour) : (activeTenant.defaultHourlyRate || 150));
+            const resolvedFixed = Number(t.fixedValue) > 0
+              ? Number(t.fixedValue)
+              : (Number(localT?.fixedValue) > 0 ? Number(localT?.fixedValue) : (resolvedPricingType === 'fixed' ? resolvedRate : undefined));
+
+            return {
+              ...t,
+              pricingType: resolvedPricingType,
+              defaultHours: resolvedHours,
+              minutes: resolvedMinutes,
+              defaultValuePerHour: resolvedRate,
+              fixedValue: resolvedFixed,
+              linkedItemIds: mergedLinks
+            };
+          });
+
+          const baseItems = sbItems.length > 0 ? sbItems : (localDb?.items && localDb.items.length > 0 ? localDb.items : []);
+          const resolvedItems = baseItems.map((item: InventoryItem) => {
+            const localI = localDb?.items?.find((li: InventoryItem) => li.id === item.id);
+            const matchingTemplate = resolvedTemplates.find((t: LaborTemplate) =>
+              (t.linkedItemIds || []).includes(item.id) ||
+              (item.partNumber && (t.linkedItemIds || []).includes(item.partNumber))
+            );
+            return {
+              ...item,
+              laborTemplateId: item.laborTemplateId || localI?.laborTemplateId || matchingTemplate?.id
+            };
+          });
+
+          const baseOrders = sbOrders.length > 0 ? sbOrders : (localDb?.serviceOrders && localDb.serviceOrders.length > 0 ? localDb.serviceOrders : []);
+          const resolvedOrders = baseOrders.map((ord: ServiceOrder) => {
+            const localOrd = localDb?.serviceOrders?.find((lo: ServiceOrder) => lo.id === ord.id);
+            return {
+              ...ord,
+              completedAt: ord.completedAt || localOrd?.completedAt,
+              completedBy: ord.completedBy || localOrd?.completedBy,
+              passportId: ord.passportId || localOrd?.passportId,
+              mechanicId: ord.mechanicId || localOrd?.mechanicId,
+              mechanicName: ord.mechanicName || localOrd?.mechanicName,
+              clientId: ord.clientId || localOrd?.clientId,
+              vehicleId: ord.vehicleId || localOrd?.vehicleId,
+              stockDeducted: ord.stockDeducted ?? localOrd?.stockDeducted ?? false
+            };
+          });
+
+          setLaborTemplates(resolvedTemplates);
+          setItems(resolvedItems);
+          setHistory(sbHistory);
+          setServiceOrders(resolvedOrders);
+          setVehicleSections(sbSections.length > 0 ? sbSections : DEFAULT_SECTIONS);
+          setClients(sbClients);
+          setUtvPassports(sbPassports.length > 0 ? sbPassports : (localDb?.utvPassports || []));
+          setSyncError(null);
+        } else if (localDb) {
+          setUsers(localDb.users || []);
+          setItems(localDb.items || []);
+          setHistory(localDb.history || []);
+          setServiceOrders(localDb.serviceOrders || []);
+          setVehicleSections(localDb.vehicleSections || DEFAULT_SECTIONS);
+          setLaborTemplates(localDb.laborTemplates || DEFAULT_LABOR_TEMPLATES);
+          setClients(localDb.clients || []);
+          setUtvPassports(localDb.utvPassports || []);
+        } else {
+          setUsers([]);
+          setItems([]);
+          setHistory([]);
+          setServiceOrders([]);
+          setVehicleSections(DEFAULT_SECTIONS);
+          setLaborTemplates(DEFAULT_LABOR_TEMPLATES);
+          setClients([]);
+          setUtvPassports([]);
+        }
+      } else {
+        // Modo local offline
+        const db = await getLocalTenantData(tenantStorageKey, activeTenant.id === DEFAULT_TENANT_ID);
+        if (isClientSession) {
+          const sourcePassports = db?.utvPassports && db.utvPassports.length > 0
+            ? db.utvPassports
+            : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []);
+          const clientPassports = sourcePassports.filter(
+            (p: UTVPassport) =>
+              (loggedUser.clientId && p.clientId === loggedUser.clientId) ||
+              p.customerName.trim().toLowerCase() === loggedUser.name.trim().toLowerCase()
+          );
+          setUsers([]);
+          setClients([]);
+          setServiceOrders([]);
+          setHistory([]);
+          setLaborTemplates([]);
+          setVehicleSections([]);
+          setItems(db?.items || (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []));
+          setUtvPassports(clientPassports);
+        } else if (db) {
+          setUsers(db.users && db.users.length > 0 ? db.users : DEFAULT_USERS);
+          setItems(db.items && db.items.length > 0 ? db.items : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []));
+          setHistory(db.history && db.history.length > 0 ? db.history : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []));
+          setServiceOrders(db.serviceOrders && db.serviceOrders.length > 0 ? db.serviceOrders : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []));
+          setVehicleSections(db.vehicleSections && db.vehicleSections.length > 0 ? db.vehicleSections : DEFAULT_SECTIONS);
+          setLaborTemplates(db.laborTemplates && db.laborTemplates.length > 0 ? db.laborTemplates : DEFAULT_LABOR_TEMPLATES);
+          setClients(db.clients && db.clients.length > 0 ? db.clients : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []));
+          setUtvPassports(db.utvPassports && db.utvPassports.length > 0 ? db.utvPassports : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []));
+        }
+      }
+    } catch (e) {
+      console.error("Erro ao carregar dados da oficina:", e);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  // Inicialização leve antes do login (não carrega dados sensíveis da oficina quando Supabase estiver online)
   useEffect(() => {
-    const loadData = async () => {
+    const loadInitialBootstrap = async () => {
       setIsSyncing(true);
       try {
-        // Limpa versões antigas e duplicatas do localStorage para evitar QuotaExceededError
         cleanupLegacyStorage();
 
         const rawCats = safeGetItem("HPS_CATEGORIES_V12");
@@ -409,7 +626,6 @@ const App: React.FC = () => {
           setCategories(Object.values(ItemCategory));
         }
 
-        // 1. Carregar lista de Oficinas (Tenants)
         let loadedTenants: Tenant[] = DEFAULT_TENANTS;
         if (supabaseService.isAvailable()) {
           try {
@@ -422,7 +638,6 @@ const App: React.FC = () => {
           }
         }
 
-        // Tenta IndexedDB primeiro para tenants, depois localStorage
         const idbTenants = await idbGet<Tenant[]>("HPS_TENANTS_V12");
         if (Array.isArray(idbTenants) && idbTenants.length > 0) {
           const map = new Map<string, Tenant>();
@@ -450,173 +665,44 @@ const App: React.FC = () => {
         const activeTenant = loadedTenants.find(t => t.id === activeTenantId) || loadedTenants[0];
         setCurrentTenant(activeTenant);
 
-        // 2. Carregar dados da oficina ativa
-        const tenantStorageKey = `${DB_KEY}_${activeTenant.id}`;
-
-        const getLocalTenantData = async (key: string, isDefault: boolean) => {
-          try {
-            const idbData = await idbGet<any>(key);
-            if (idbData && typeof idbData === 'object') {
-              return idbData;
-            }
-          } catch {}
-
-          const raw = safeGetItem(key) || (isDefault ? safeGetItem(DB_KEY) : null);
-          if (raw) {
-            try {
-              const parsed = JSON.parse(raw);
-              idbSet(key, parsed);
-              return parsed;
-            } catch {
-              return null;
-            }
-          }
-          return null;
-        };
-
         if (supabaseService.isAvailable()) {
-          const fetchWithFallback = async <T,>(promise: Promise<T>, fallback: T): Promise<T> => {
-            try {
-              return await promise;
-            } catch (err) {
-              console.error("Erro ao buscar dados do Supabase:", err);
-              return fallback;
-            }
-          };
-
-          const sbUsers = await fetchWithFallback(supabaseService.getUsers(activeTenant.id), []);
-          const sbItems = await fetchWithFallback(supabaseService.getItems(activeTenant.id), []);
-          const sbHistory = await fetchWithFallback(supabaseService.getHistory(activeTenant.id), []);
-          const sbOrders = await fetchWithFallback(supabaseService.getServiceOrders(activeTenant.id), []);
-          const sbSections = await fetchWithFallback(supabaseService.getVehicleSections(activeTenant.id), []);
-          const sbTemplates = await fetchWithFallback(supabaseService.getLaborTemplates(activeTenant.id), []);
-          const sbClients = await fetchWithFallback(supabaseService.getClients(activeTenant.id), []);
-          const sbPassports = await fetchWithFallback(supabaseService.getUTVPassports(activeTenant.id), []);
-
-          if (sbUsers.length || sbItems.length || sbHistory.length || sbOrders.length || sbSections.length || sbTemplates.length || sbClients.length || sbPassports.length) {
-            let finalUsers = [...sbUsers];
-            const fallbackKeys = [tenantStorageKey, DB_KEY, "HPS_PRO_DATA_V12", "HPS_PRO_DATA_V11", "HPS_USERS"];
-            for (const key of fallbackKeys) {
-              const rawData = safeGetItem(key);
-              if (rawData) {
-                try {
-                  const parsed = JSON.parse(rawData);
-                  const candidateList: User[] = Array.isArray(parsed) ? parsed : (parsed.users || []);
-                  if (candidateList && candidateList.length > 0) {
-                    if (finalUsers.length === 0) {
-                      finalUsers = candidateList;
-                    } else {
-                      const existingUsernames = new Set(finalUsers.map(u => (u.username || '').toLowerCase()));
-                      const existingIds = new Set(finalUsers.map(u => u.id));
-                      for (const u of candidateList) {
-                        if (!existingIds.has(u.id) && !existingUsernames.has((u.username || '').toLowerCase())) {
-                          finalUsers.push(u);
-                        }
-                      }
-                    }
-                  }
-                } catch {}
-              }
-            }
-            if (finalUsers.length === 0) finalUsers = DEFAULT_USERS;
-            setUsers(finalUsers);
-
-            const localDb = await getLocalTenantData(tenantStorageKey, activeTenant.id === DEFAULT_TENANT_ID);
-            
-            // Mescla templates do Supabase preservando linkedItemIds e valores do cache local caso colunas novas do Supabase não tenham retornado
-            const baseTemplates = sbTemplates.length > 0 ? sbTemplates : (localDb?.laborTemplates && localDb.laborTemplates.length > 0 ? localDb.laborTemplates : DEFAULT_LABOR_TEMPLATES);
-            const resolvedTemplates = baseTemplates.map(t => {
-              const localT = localDb?.laborTemplates?.find((lt: LaborTemplate) => lt.id === t.id);
-              const tLinks = Array.isArray(t.linkedItemIds) 
-                ? t.linkedItemIds 
-                : (typeof t.linkedItemIds === 'string' ? (() => { try { return JSON.parse(t.linkedItemIds); } catch { return []; } })() : []);
-              const lLinks = Array.isArray(localT?.linkedItemIds) ? localT.linkedItemIds : [];
-              const mergedLinks = Array.from(new Set([...tLinks, ...lLinks]));
-              const resolvedPricingType = t.pricingType || localT?.pricingType || 'hourly';
-              const resolvedMinutes = t.minutes !== undefined ? Number(t.minutes) : (localT?.minutes !== undefined ? Number(localT.minutes) : 0);
-              const rawHours = Number(t.defaultHours) > 0 ? Number(t.defaultHours) : (Number(localT?.defaultHours) > 0 ? Number(localT?.defaultHours) : 0);
-              const resolvedHours = resolvedPricingType === 'fixed' ? (rawHours || 1) : ((rawHours === 0 && resolvedMinutes === 0) ? 1 : rawHours);
-              const resolvedRate = Number(t.defaultValuePerHour) > 0
-                ? Number(t.defaultValuePerHour)
-                : (Number(localT?.defaultValuePerHour) > 0 ? Number(localT?.defaultValuePerHour) : (activeTenant.defaultHourlyRate || 150));
-              const resolvedFixed = Number(t.fixedValue) > 0
-                ? Number(t.fixedValue)
-                : (Number(localT?.fixedValue) > 0 ? Number(localT?.fixedValue) : (resolvedPricingType === 'fixed' ? resolvedRate : undefined));
-
-              return {
-                ...t,
-                pricingType: resolvedPricingType,
-                defaultHours: resolvedHours,
-                minutes: resolvedMinutes,
-                defaultValuePerHour: resolvedRate,
-                fixedValue: resolvedFixed,
-                linkedItemIds: mergedLinks
-              };
-            });
-
-            // Mescla itens preservando laborTemplateId
-            const baseItems = sbItems.length > 0 ? sbItems : (localDb?.items && localDb.items.length > 0 ? localDb.items : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []));
-            const resolvedItems = baseItems.map(item => {
-              const localI = localDb?.items?.find((li: InventoryItem) => li.id === item.id);
-              const matchingTemplate = resolvedTemplates.find(t => 
-                (t.linkedItemIds || []).includes(item.id) || 
-                (item.partNumber && (t.linkedItemIds || []).includes(item.partNumber))
-              );
-              return {
-                ...item,
-                laborTemplateId: item.laborTemplateId || localI?.laborTemplateId || matchingTemplate?.id
-              };
-            });
-
-            const baseOrders = sbOrders.length > 0 ? sbOrders : (localDb?.serviceOrders && localDb.serviceOrders.length > 0 ? localDb.serviceOrders : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []));
-            const resolvedOrders = baseOrders.map((ord: ServiceOrder) => {
-              const localOrd = localDb?.serviceOrders?.find((lo: ServiceOrder) => lo.id === ord.id);
-              return {
-                ...ord,
-                completedAt: ord.completedAt || localOrd?.completedAt,
-                completedBy: ord.completedBy || localOrd?.completedBy,
-                passportId: ord.passportId || localOrd?.passportId,
-                mechanicId: ord.mechanicId || localOrd?.mechanicId,
-                mechanicName: ord.mechanicName || localOrd?.mechanicName,
-                clientId: ord.clientId || localOrd?.clientId,
-                vehicleId: ord.vehicleId || localOrd?.vehicleId,
-                stockDeducted: ord.stockDeducted ?? localOrd?.stockDeducted ?? false
-              };
-            });
-
-            setLaborTemplates(resolvedTemplates);
-            setItems(resolvedItems);
-            setHistory(sbHistory.length > 0 ? sbHistory : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []));
-            setServiceOrders(resolvedOrders);
-            setVehicleSections(sbSections.length > 0 ? sbSections : DEFAULT_SECTIONS);
-            setClients(sbClients.length > 0 ? sbClients : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []));
-            setUtvPassports(sbPassports.length > 0 ? sbPassports : (localDb?.utvPassports && localDb.utvPassports.length > 0 ? localDb.utvPassports : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : [])));
-            setSyncError(null);
-          } else {
-            // Fallback para IndexedDB / localStorage
-            const db = await getLocalTenantData(tenantStorageKey, activeTenant.id === DEFAULT_TENANT_ID);
-            if (db) {
-              setUsers(db.users && db.users.length > 0 ? db.users : DEFAULT_USERS);
-              setItems(db.items && db.items.length > 0 ? db.items : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []));
-              setHistory(db.history && db.history.length > 0 ? db.history : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []));
-              setServiceOrders(db.serviceOrders && db.serviceOrders.length > 0 ? db.serviceOrders : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []));
-              setVehicleSections(db.vehicleSections && db.vehicleSections.length > 0 ? db.vehicleSections : DEFAULT_SECTIONS);
-              setLaborTemplates(db.laborTemplates && db.laborTemplates.length > 0 ? db.laborTemplates : DEFAULT_LABOR_TEMPLATES);
-              setClients(db.clients && db.clients.length > 0 ? db.clients : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []));
-              setUtvPassports(db.utvPassports && db.utvPassports.length > 0 ? db.utvPassports : (activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []));
-            } else {
-              setUsers(DEFAULT_USERS);
-              setItems(activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []);
-              setHistory(activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []);
-              setServiceOrders(activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []);
-              setVehicleSections(DEFAULT_SECTIONS);
-              setLaborTemplates(DEFAULT_LABOR_TEMPLATES);
-              setClients(activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []);
-              setUtvPassports(activeTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []);
+          // Se veio com ?utv_passport=..., consulta apenas a pré-visualização pública segura (compatível com RLS restrito)
+          if (publicClientPassportId) {
+            const preview = await supabaseService.getPublicPassportPreview(publicClientPassportId);
+            if (preview && preview.id) {
+              setPublicPreviewPassport(preview as UTVPassport);
             }
           }
+
+          // Restaurar sessão oficial do Supabase Auth se o usuário já estiver autenticado
+          const existingSession = await supabaseService.getSession();
+          if (existingSession) {
+            const authProfile = await supabaseService.getAuthenticatedProfile();
+            if (authProfile) {
+              try {
+                const sbTenantsAuth = await supabaseService.getTenants();
+                if (sbTenantsAuth && sbTenantsAuth.length > 0) {
+                  loadedTenants = sbTenantsAuth;
+                  setTenants(sbTenantsAuth);
+                }
+              } catch {}
+              const targetTenant = loadedTenants.find(t => t.id === authProfile.tenantId) || activeTenant;
+              if (targetTenant.id !== activeTenant.id) {
+                setCurrentTenant(targetTenant);
+                safeSetItem("HPS_ACTIVE_TENANT_ID", targetTenant.id);
+              }
+              const restoredUser: User = authProfile.role === UserRole.CLIENT
+                ? { ...authProfile, allowedPassportId: publicClientPassportId || undefined }
+                : authProfile;
+              await loadTenantWorkspaceData(targetTenant, restoredUser);
+              setCurrentUser(restoredUser);
+              setIsLoggedIn(true);
+            }
+          }
+          setSyncError(null);
         } else {
-          // Supabase não configurado, usa dados locais particionados
+          // Modo local offline: carrega base local para autenticação e uso offline
+          const tenantStorageKey = `${DB_KEY}_${activeTenant.id}`;
           const db = await getLocalTenantData(tenantStorageKey, activeTenant.id === DEFAULT_TENANT_ID);
           if (db) {
             setUsers(db.users && db.users.length > 0 ? db.users : DEFAULT_USERS);
@@ -640,15 +726,36 @@ const App: React.FC = () => {
           setSyncError("Supabase não configurado. Usando modo local multi-tenant.");
         }
       } catch (e: any) {
-        console.error("Erro ao carregar dados, usando local", e);
-        setSyncError("Erro de conexão com Supabase. Usando dados locais.");
+        console.error("Erro ao inicializar aplicativo:", e);
+        setSyncError("Erro de conexão com Supabase.");
       } finally {
         setIsSyncing(false);
         setDbLoaded(true);
       }
     };
 
-    loadData();
+    loadInitialBootstrap();
+
+    const authSub = supabaseService.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT') {
+        setIsLoggedIn(false);
+        setCurrentUser(null);
+        if (supabaseService.isAvailable()) {
+          setUsers([]);
+          setItems([]);
+          setHistory([]);
+          setServiceOrders([]);
+          setVehicleSections([]);
+          setLaborTemplates([]);
+          setClients([]);
+          setUtvPassports([]);
+        }
+      }
+    });
+
+    return () => {
+      authSub?.unsubscribe?.();
+    };
   }, []);
 
   // Sincroniza formulário de dados da oficina com a oficina ativa
@@ -675,17 +782,15 @@ const App: React.FC = () => {
     }
   }, [currentTenant]);
 
-  // Salva no banco de dados local particionado por oficina
+  // Salva no banco de dados local particionado por oficina SOMENTE para sessão autenticada da equipe
   useEffect(() => {
-    if (!dbLoaded || !currentTenant) return;
+    if (!dbLoaded || !currentTenant || !isLoggedIn || !currentUser || currentUser.role === UserRole.CLIENT) return;
     
     const db = { users, items, history, serviceOrders, vehicleSections, laborTemplates, clients, utvPassports };
     
-    // 1. Salva no IndexedDB nativo (armazenamento robusto sem restrição de 5MB)
     idbSet(`${DB_KEY}_${currentTenant.id}`, db);
     idbSet("HPS_TENANTS_V12", tenants);
 
-    // 2. Salva no localStorage com tratamento resiliente contra QuotaExceededError
     safeSetItem(`${DB_KEY}_${currentTenant.id}`, JSON.stringify(db));
     safeSetItem("HPS_TENANTS_V12", JSON.stringify(tenants));
     safeSetItem("HPS_ACTIVE_TENANT_ID", currentTenant.id);
@@ -693,10 +798,14 @@ const App: React.FC = () => {
     if (categories.length > 0) {
       safeSetItem("HPS_CATEGORIES_V12", JSON.stringify(categories));
     }
-  }, [users, items, history, serviceOrders, vehicleSections, laborTemplates, categories, clients, utvPassports, tenants, currentTenant, dbLoaded]);
+  }, [users, items, history, serviceOrders, vehicleSections, laborTemplates, categories, clients, utvPassports, tenants, currentTenant, dbLoaded, isLoggedIn, currentUser]);
 
-  // Alternar de oficina ativa
+  // Alternar de oficina ativa (Restrito ao Administrador)
   const handleSwitchTenant = async (targetTenant: Tenant) => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem alternar entre oficinas.", "error");
+      return;
+    }
     setCurrentTenant(targetTenant);
     safeSetItem("HPS_ACTIVE_TENANT_ID", targetTenant.id);
     setIsTenantDropdownOpen(false);
@@ -714,25 +823,28 @@ const App: React.FC = () => {
     }
     
     if (localDb) {
-      setItems(localDb.items || (targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []));
-      setHistory(localDb.history || (targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []));
-      setServiceOrders(localDb.serviceOrders || (targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []));
+      setUsers(localDb.users || (!supabaseService.isAvailable() ? DEFAULT_USERS : []));
+      setItems(localDb.items || (!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []));
+      setHistory(localDb.history || (!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []));
+      setServiceOrders(localDb.serviceOrders || (!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []));
       setVehicleSections(localDb.vehicleSections || DEFAULT_SECTIONS);
       setLaborTemplates(localDb.laborTemplates || DEFAULT_LABOR_TEMPLATES);
-      setClients(localDb.clients || (targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []));
-      setUtvPassports(localDb.utvPassports || (targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []));
+      setClients(localDb.clients || (!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []));
+      setUtvPassports(localDb.utvPassports || (!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []));
     } else {
-      setItems(targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []);
-      setHistory(targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []);
-      setServiceOrders(targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []);
+      setUsers(!supabaseService.isAvailable() ? DEFAULT_USERS : []);
+      setItems(!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_ITEMS : []);
+      setHistory(!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_HISTORY : []);
+      setServiceOrders(!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_SERVICE_ORDERS : []);
       setVehicleSections(DEFAULT_SECTIONS);
       setLaborTemplates(DEFAULT_LABOR_TEMPLATES);
-      setClients(targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []);
-      setUtvPassports(targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []);
+      setClients(!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_CLIENTS : []);
+      setUtvPassports(!supabaseService.isAvailable() && targetTenant.id === DEFAULT_TENANT_ID ? DEFAULT_UTV_PASSPORTS : []);
     }
 
     if (supabaseService.isAvailable()) {
       Promise.all([
+        supabaseService.getUsers(targetTenant.id),
         supabaseService.getItems(targetTenant.id),
         supabaseService.getHistory(targetTenant.id),
         supabaseService.getServiceOrders(targetTenant.id),
@@ -740,7 +852,8 @@ const App: React.FC = () => {
         supabaseService.getLaborTemplates(targetTenant.id),
         supabaseService.getClients(targetTenant.id),
         supabaseService.getUTVPassports(targetTenant.id)
-      ]).then(([sbItems, sbHistory, sbOrders, sbSections, sbTemplates, sbClients, sbPassports]) => {
+      ]).then(([sbUsers, sbItems, sbHistory, sbOrders, sbSections, sbTemplates, sbClients, sbPassports]) => {
+        if (sbUsers.length) setUsers(sbUsers);
         if (sbItems.length) setItems(sbItems);
         if (sbHistory.length) setHistory(sbHistory);
         if (sbOrders.length) setServiceOrders(sbOrders);
@@ -756,9 +869,13 @@ const App: React.FC = () => {
     showAlert("Ambiente Alterado", `Você agora está gerenciando a oficina: ${targetTenant.name}`, "info");
   };
 
-  // Cadastrar nova oficina (Self-onboarding SaaS)
+  // Cadastrar nova oficina (Self-onboarding SaaS - Restrito ao Administrador)
   const handleCreateTenant = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem cadastrar novas oficinas.", "error");
+      return;
+    }
     if (!newTenantInput.name.trim()) {
       showAlert("Campo Obrigatório", "Por favor, informe o nome da nova oficina.", "error");
       return;
@@ -816,9 +933,13 @@ const App: React.FC = () => {
     showAlert("Nova Oficina Criada!", `A oficina "${newTenant.name}" foi cadastrada e ativada com sucesso!`, "success");
   };
 
-  // Salvar configurações e identidade visual da oficina ativa
+  // Salvar configurações e identidade visual da oficina ativa (Restrito ao Administrador)
   const handleSaveCompanySettings = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem alterar os dados da oficina.", "error");
+      return;
+    }
     if (!companySettingsForm.name.trim()) {
       showAlert("Campo Obrigatório", "O nome da oficina não pode ficar vazio.", "error");
       return;
@@ -865,6 +986,10 @@ const App: React.FC = () => {
 
   // Reajuste rápido do valor cobrado por hora da oficina
   const handleQuickUpdateHourlyRate = async (newRate: number) => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem reajustar o valor por hora.", "error");
+      return;
+    }
     const validRate = Number(newRate) || 150;
     if (validRate <= 0) {
       showAlert("Valor Inválido", "Por favor, informe um valor por hora válido.", "error");
@@ -895,85 +1020,13 @@ const App: React.FC = () => {
     );
   };
 
-  // Exportar backup completo dos dados da oficina ativa (JSON)
+  // Exportar / Importar backup completo unificado (inclui Passaportes UTV e sincronização em nuvem)
   const handleExportTenantData = () => {
-    try {
-      const dataToExport = {
-        exportedAt: new Date().toISOString(),
-        version: "1.0",
-        tenant: currentTenant,
-        users: users.filter(u => !u.tenantId || u.tenantId === currentTenant.id),
-        items: items.filter(i => !i.tenantId || i.tenantId === currentTenant.id),
-        history: history.filter(h => !h.tenantId || h.tenantId === currentTenant.id),
-        serviceOrders: serviceOrders.filter(o => !o.tenantId || o.tenantId === currentTenant.id),
-        clients: clients.filter(c => !c.tenantId || c.tenantId === currentTenant.id),
-        vehicleSections: vehicleSections.filter(s => !s.tenantId || s.tenantId === currentTenant.id),
-        laborTemplates: laborTemplates.filter(t => !t.tenantId || t.tenantId === currentTenant.id)
-      };
-
-      const blob = new Blob([JSON.stringify(dataToExport, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      const safeName = currentTenant.name.toLowerCase().replace(/[^a-z0-9]/g, '_');
-      a.href = url;
-      a.download = `backup_${safeName}_${new Date().toISOString().slice(0, 10)}.json`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-
-      showAlert("Backup Gerado", `Backup da oficina "${currentTenant.name}" baixado com sucesso em formato JSON!`, "success");
-    } catch (e: any) {
-      showAlert("Erro na Exportação", `Não foi possível exportar os dados: ${e.message}`, "error");
-    }
+    handleExportFullBackupJson();
   };
 
-  // Importar backup JSON para a oficina ativa
   const handleImportTenantData = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const content = event.target?.result as string;
-        const parsed = JSON.parse(content);
-
-        if (!parsed || typeof parsed !== 'object') {
-          throw new Error("Arquivo de backup inválido.");
-        }
-
-        if (Array.isArray(parsed.items) && parsed.items.length > 0) {
-          const taggedItems = parsed.items.map((i: any) => ({ ...i, tenantId: currentTenant.id }));
-          setItems(taggedItems);
-        }
-        if (Array.isArray(parsed.history) && parsed.history.length > 0) {
-          const taggedHistory = parsed.history.map((h: any) => ({ ...h, tenantId: currentTenant.id }));
-          setHistory(taggedHistory);
-        }
-        if (Array.isArray(parsed.serviceOrders) && parsed.serviceOrders.length > 0) {
-          const taggedOrders = parsed.serviceOrders.map((o: any) => ({ ...o, tenantId: currentTenant.id }));
-          setServiceOrders(taggedOrders);
-        }
-        if (Array.isArray(parsed.clients) && parsed.clients.length > 0) {
-          const taggedClients = parsed.clients.map((c: any) => ({ ...c, tenantId: currentTenant.id }));
-          setClients(taggedClients);
-        }
-        if (Array.isArray(parsed.vehicleSections) && parsed.vehicleSections.length > 0) {
-          setVehicleSections(parsed.vehicleSections.map((s: any) => ({ ...s, tenantId: currentTenant.id })));
-        }
-        if (Array.isArray(parsed.laborTemplates) && parsed.laborTemplates.length > 0) {
-          setLaborTemplates(parsed.laborTemplates.map((t: any) => ({ ...t, tenantId: currentTenant.id })));
-        }
-
-        showAlert("Importação Concluída", `Dados importados com sucesso para a oficina "${currentTenant.name}"!`, "success");
-      } catch (err: any) {
-        showAlert("Erro de Importação", `Falha ao processar arquivo: ${err.message}`, "error");
-      } finally {
-        e.target.value = '';
-      }
-    };
-    reader.readAsText(file);
+    handleImportFullBackupJson(e);
   };
 
   const syncToSupabase = async () => {
@@ -997,10 +1050,12 @@ const App: React.FC = () => {
       const scopedPassports = utvPassports.map(p => ({ ...p, tenantId: p.tenantId || currentTenant.id }));
 
       const tasks = [
-        { name: 'tenants', label: 'Oficinas', action: () => supabaseService.saveTenant(currentTenant) },
-        { name: 'users', label: 'Usuários', action: () => supabaseService.saveUser(scopedUsers) },
-        { name: 'vehicle_sections', label: 'Setores do Veículo', action: () => supabaseService.saveVehicleSection(scopedSections) },
-        { name: 'labor_templates', label: 'Modelos de Mão de Obra', action: () => supabaseService.saveLaborTemplate(scopedTemplates) },
+        ...(isAdmin ? [
+          { name: 'tenants', label: 'Oficinas', action: () => supabaseService.saveTenant(currentTenant) },
+          { name: 'users', label: 'Usuários', action: () => supabaseService.saveUser(scopedUsers) },
+          { name: 'vehicle_sections', label: 'Setores do Veículo', action: () => supabaseService.saveVehicleSection(scopedSections) },
+          { name: 'labor_templates', label: 'Modelos de Mão de Obra', action: () => supabaseService.saveLaborTemplate(scopedTemplates) },
+        ] : []),
         { name: 'clients', label: 'Clientes', action: () => supabaseService.saveClient(scopedClients) },
         { name: 'items', label: 'Peças & Estoque', action: () => supabaseService.saveItem(scopedItems) },
         { name: 'utv_passports', label: 'Passaporte UTV', action: () => supabaseService.saveUTVPassport(scopedPassports) },
@@ -1053,8 +1108,12 @@ const App: React.FC = () => {
     }
   };
 
-  // --- EXPORTAR BACKUP COMPLETO (.JSON) DA OFICINA ATIVA ---
+  // --- EXPORTAR BACKUP COMPLETO (.JSON) DA OFICINA ATIVA (RESTRITO AO ADMIN) ---
   const handleExportFullBackupJson = () => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem exportar backups completos do sistema.", "error");
+      return;
+    }
     try {
       const snapshot = {
         app: 'HPS_CONTROL',
@@ -1110,10 +1169,14 @@ const App: React.FC = () => {
     }
   };
 
-  // --- IMPORTAR BACKUP COMPLETO (.JSON) E MIGRAR PARA O SUPABASE ---
+  // --- IMPORTAR BACKUP COMPLETO (.JSON) E MIGRAR PARA O SUPABASE (RESTRITO AO ADMIN) ---
   const handleImportFullBackupJson = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = '';
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem importar ou restaurar backups.", "error");
+      return;
+    }
     if (!file) return;
 
     const reader = new FileReader();
@@ -1293,8 +1356,12 @@ const App: React.FC = () => {
   const handleRunSupabaseDiagnostics = async () => {
     setIsRunningDiag(true);
     try {
-      const report = await supabaseService.runDiagnostics(currentTenant.id);
+      const [report, edgeHealth] = await Promise.all([
+        supabaseService.runDiagnostics(currentTenant.id),
+        supabaseService.checkAuthEdgeFunctionHealth()
+      ]);
       setDiagReport(report);
+      setAuthEdgeStatus(edgeHealth);
     } catch (e: any) {
       showAlert('Erro no Diagnóstico', e?.message || 'Não foi possível consultar o Supabase.', 'error');
     } finally {
@@ -1302,8 +1369,12 @@ const App: React.FC = () => {
     }
   };
 
-  // --- FORÇAR ESPELHO LIMPO (ESTE NAVEGADOR -> SUPABASE) ---
+  // --- FORÇAR ESPELHO LIMPO (ESTE NAVEGADOR -> SUPABASE - RESTRITO AO ADMIN) ---
   const handlePushLocalToSupabaseClean = () => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem executar substituição de banco na nuvem.", "error");
+      return;
+    }
     if (!supabaseService.isAvailable()) {
       showAlert(
         'Supabase Não Conectado Aqui',
@@ -1376,10 +1447,7 @@ const App: React.FC = () => {
     );
   };
 
-  // --- AUTH STATE ---
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [loginForm, setLoginForm] = useState({ username: '', password: '' });
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  // --- AUTH HANDLERS ---
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1388,32 +1456,57 @@ const App: React.FC = () => {
       const cleanUsername = loginForm.username.trim().toLowerCase();
       const rawPassword = loginForm.password.trim();
 
-      // 1. Verificar primeiro se é um Login de CLIENTE (Acesso Travado ao Espelho do Cliente)
-      let matchedClient: Client | null = clients.find(
-        c => c.username && c.username.trim().toLowerCase() === cleanUsername && c.password === rawPassword
-      ) || null;
-
-      if (!matchedClient) {
-        // Fallback para clientes padrão de demonstração caso o estado local antigo ainda não tinha username
-        const defaultMatched = DEFAULT_CLIENTS.find(
-          c => c.username && c.username.trim().toLowerCase() === cleanUsername && c.password === rawPassword
-        );
-        if (defaultMatched) {
-          matchedClient = defaultMatched;
-          setClients(prev => prev.map(c => c.id === defaultMatched.id ? { ...c, username: defaultMatched.username, password: defaultMatched.password, isAccessActive: true } : c));
-        }
+      if (!cleanUsername || !rawPassword) {
+        showAlert("Campos Obrigatórios", "Informe seu usuário e senha para entrar.", "error");
+        return;
       }
 
-      if (!matchedClient && supabaseService.isAvailable()) {
-        try {
-          matchedClient = await supabaseService.authenticateClient(cleanUsername, rawPassword);
-        } catch (err) {
-          console.warn("Aviso ao consultar login de cliente no Supabase:", err);
-        }
-      }
+      if (supabaseService.isAvailable()) {
+        // 1. Fluxo oficial Supabase Auth (com auto-migração transparente na primeira entrada após publicar Edge Function)
+        const authAttempt = await supabaseService.signInWithAuthOrMigrate(cleanUsername, loginForm.password);
+        if (authAttempt.user) {
+          const loggedProfile = authAttempt.user;
+          let activeTenants = tenants;
+          try {
+            const sbTenants = await supabaseService.getTenants();
+            if (sbTenants && sbTenants.length > 0) {
+              activeTenants = sbTenants;
+              setTenants(sbTenants);
+            }
+          } catch {}
 
-      if (matchedClient) {
-        if (matchedClient.isAccessActive === false) {
+          const targetTenant = activeTenants.find(t => t.id === loggedProfile.tenantId) || currentTenant;
+          if (targetTenant.id !== currentTenant.id) {
+            setCurrentTenant(targetTenant);
+            safeSetItem("HPS_ACTIVE_TENANT_ID", targetTenant.id);
+          }
+
+          if (loggedProfile.role === UserRole.CLIENT) {
+            supabaseService.logClientMirrorAccess({
+              id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
+              clientId: loggedProfile.clientId || loggedProfile.id,
+              clientName: loggedProfile.name,
+              passportId: publicClientPassportId || undefined,
+              accessedAt: new Date().toISOString(),
+              tenantId: loggedProfile.tenantId || targetTenant.id
+            });
+            const clientWithUrl: User = {
+              ...loggedProfile,
+              allowedPassportId: publicClientPassportId || undefined
+            };
+            await loadTenantWorkspaceData(targetTenant, clientWithUrl);
+            setCurrentUser(clientWithUrl);
+            setIsLoggedIn(true);
+            return;
+          }
+
+          await loadTenantWorkspaceData(targetTenant, loggedProfile);
+          setCurrentUser(loggedProfile);
+          setIsLoggedIn(true);
+          return;
+        }
+
+        if (authAttempt.error && !authAttempt.edgeUnavailable && authAttempt.error.toLowerCase().includes('bloqueado')) {
           showAlert(
             "Acesso Bloqueado",
             "O seu acesso ao Espelho do Cliente foi temporariamente desativado pela oficina. Entre em contato com a administração.",
@@ -1422,71 +1515,141 @@ const App: React.FC = () => {
           return;
         }
 
-        // Registrar log de auditoria de acesso ao Espelho no Supabase
-        if (supabaseService.isAvailable()) {
-          supabaseService.logClientMirrorAccess({
-            id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
-            clientId: matchedClient.id,
-            clientName: matchedClient.name,
-            passportId: publicClientPassportId || undefined,
-            accessedAt: new Date().toISOString(),
-            tenantId: matchedClient.tenantId || currentTenant.id
-          });
+        // 2. Fallback de transição SOMENTE enquanto a Edge Function "manage-auth-users" ainda não foi publicada
+        if (authAttempt.edgeUnavailable) {
+          let matchedClient: Client | null = null;
+          try {
+            matchedClient = await supabaseService.authenticateClient(cleanUsername, rawPassword);
+          } catch (err) {
+            console.warn("Aviso ao consultar login de cliente no Supabase:", err);
+          }
+
+          if (matchedClient) {
+            if (matchedClient.isAccessActive === false) {
+              showAlert(
+                "Acesso Bloqueado",
+                "O seu acesso ao Espelho do Cliente foi temporariamente desativado pela oficina. Entre em contato com a administração.",
+                "error"
+              );
+              return;
+            }
+
+            const targetTenant = tenants.find(t => t.id === matchedClient!.tenantId) || currentTenant;
+            if (targetTenant.id !== currentTenant.id) {
+              setCurrentTenant(targetTenant);
+              safeSetItem("HPS_ACTIVE_TENANT_ID", targetTenant.id);
+            }
+
+            supabaseService.logClientMirrorAccess({
+              id: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
+              clientId: matchedClient.id,
+              clientName: matchedClient.name,
+              passportId: publicClientPassportId || undefined,
+              accessedAt: new Date().toISOString(),
+              tenantId: matchedClient.tenantId || targetTenant.id
+            });
+
+            const clientUser: User = {
+              id: matchedClient.id,
+              username: matchedClient.username || cleanUsername,
+              name: matchedClient.name,
+              role: UserRole.CLIENT,
+              clientId: matchedClient.id,
+              allowedPassportId: publicClientPassportId || undefined,
+              tenantId: matchedClient.tenantId || targetTenant.id
+            };
+            await loadTenantWorkspaceData(targetTenant, clientUser);
+            setCurrentUser(clientUser);
+            setIsLoggedIn(true);
+            return;
+          }
+
+          let staffUser: User | null = null;
+          try {
+            staffUser = await supabaseService.login(loginForm.username.trim(), loginForm.password);
+          } catch (rpcErr: any) {
+            const msg = String(rpcErr?.message || '');
+            const code = String(rpcErr?.code || '');
+            if (code === 'PGRST202' || code === '42883' || msg.toLowerCase().includes('could not find the function')) {
+              showAlert(
+                "Configuração Pendente no Banco",
+                "A função segura de autenticação (login_user) ainda não está instalada no Supabase. Execute o Script SQL atualizado no SQL Editor do painel Supabase.",
+                "error"
+              );
+              return;
+            }
+            throw rpcErr;
+          }
+
+          if (staffUser) {
+            const targetTenant = tenants.find(t => t.id === staffUser!.tenantId) || currentTenant;
+            if (targetTenant.id !== currentTenant.id) {
+              setCurrentTenant(targetTenant);
+              safeSetItem("HPS_ACTIVE_TENANT_ID", targetTenant.id);
+            }
+            await loadTenantWorkspaceData(targetTenant, staffUser);
+            setCurrentUser(staffUser);
+            setIsLoggedIn(true);
+            return;
+          }
+        }
+
+        showAlert(
+          "Login Inválido",
+          publicClientPassportId
+            ? "Login ou senha de cliente incorretos. Utilize as credenciais enviadas pela oficina."
+            : "Usuário ou senha incorretos. Verifique suas credenciais com o administrador da oficina.",
+          "error"
+        );
+        return;
+      }
+
+      // MODO LOCAL OFFLINE (sem variáveis do Supabase configuradas): verifica apenas cadastros locais com senha explícita
+      const matchedLocalClient = clients.find(
+        c => c.username && c.username.trim().toLowerCase() === cleanUsername && Boolean(c.password) && c.password === rawPassword
+      ) || null;
+
+      if (matchedLocalClient) {
+        if (matchedLocalClient.isAccessActive === false) {
+          showAlert(
+            "Acesso Bloqueado",
+            "O seu acesso ao Espelho do Cliente foi temporariamente desativado pela oficina. Entre em contato com a administração.",
+            "error"
+          );
+          return;
         }
 
         const clientUser: User = {
-          id: matchedClient.id,
-          username: matchedClient.username || cleanUsername,
-          name: matchedClient.name,
+          id: matchedLocalClient.id,
+          username: matchedLocalClient.username || cleanUsername,
+          name: matchedLocalClient.name,
           role: UserRole.CLIENT,
-          clientId: matchedClient.id,
+          clientId: matchedLocalClient.id,
           allowedPassportId: publicClientPassportId || undefined,
-          tenantId: matchedClient.tenantId || currentTenant.id
+          tenantId: matchedLocalClient.tenantId || currentTenant.id
         };
+        await loadTenantWorkspaceData(currentTenant, clientUser);
         setCurrentUser(clientUser);
         setIsLoggedIn(true);
         return;
       }
 
-      // 2. Caso não seja cliente, autenticar como Funcionário / Equipe da Oficina
-      let user: User | null = null;
-      if (supabaseService.isAvailable()) {
-        try {
-          user = await supabaseService.login(loginForm.username, loginForm.password);
-        } catch (error) {
-          console.error("Erro na chamada RPC do Supabase:", error);
-        }
-      }
-      
-      if (user) {
-        setCurrentUser(user);
+      const foundLocalStaff = users.find(
+        u => u.username.toLowerCase() === cleanUsername && Boolean(u.password) && u.password === loginForm.password
+      );
+
+      if (foundLocalStaff) {
+        await loadTenantWorkspaceData(currentTenant, foundLocalStaff);
+        setCurrentUser(foundLocalStaff);
         setIsLoggedIn(true);
       } else {
-        const found = users.find(u => u.username.toLowerCase() === cleanUsername && (
-          u.password === loginForm.password || 
-          (!u.password && (loginForm.password === '123' || loginForm.password === 'admin'))
-        ));
-
-        if (found) {
-          setCurrentUser(found);
-          setIsLoggedIn(true);
-        } else if ((cleanUsername === 'admin' && loginForm.password === 'admin') || (cleanUsername === 'carlos' && (loginForm.password === '123' || loginForm.password === '123456'))) {
-          const matched = users.find(u => u.username.toLowerCase() === cleanUsername) || 
-                          (cleanUsername === 'admin' ? DEFAULT_USERS[0] : DEFAULT_USERS[1]);
-          if (!users.some(u => u.id === matched.id)) {
-            setUsers(prev => [matched, ...prev]);
-          }
-          setCurrentUser(matched);
-          setIsLoggedIn(true);
-        } else {
-          showAlert(
-            "Login Inválido",
-            publicClientPassportId
-              ? "Login ou senha de cliente incorretos. Utilize as credenciais enviadas pela oficina (Dica de teste: guilherme / 123)."
-              : "Usuário ou senha incorretos. Dica de teste: admin / admin, carlos / 123 ou cliente: guilherme / 123",
-            "error"
-          );
-        }
+        showAlert(
+          "Login Inválido",
+          publicClientPassportId
+            ? "Login ou senha de cliente incorretos. Utilize as credenciais enviadas pela oficina."
+            : "Usuário ou senha incorretos. Verifique suas credenciais com o administrador da oficina.",
+          "error"
+        );
       }
     } catch (error: any) {
       console.error("Erro inesperado no login:", error);
@@ -1497,11 +1660,27 @@ const App: React.FC = () => {
     }
   };
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    await supabaseService.signOut();
     setIsLoggedIn(false);
     setCurrentUser(null);
     setSelectedClientLockedPassportId(null);
+    setSelectedItem(null);
+    setSelectedOS(null);
+    setSelectedPassport(null);
+    setClientMirrorPassport(null);
     setActiveTab('dashboard');
+    setLoginForm({ username: '', password: '' });
+    if (supabaseService.isAvailable()) {
+      setUsers([]);
+      setItems([]);
+      setHistory([]);
+      setServiceOrders([]);
+      setVehicleSections([]);
+      setLaborTemplates([]);
+      setClients([]);
+      setUtvPassports([]);
+    }
   };
 
   const generateId = () => {
@@ -1511,17 +1690,25 @@ const App: React.FC = () => {
     return Math.random().toString(36).substr(2, 9);
   };
 
-  const isAdmin = currentUser?.role === UserRole.STOCKIST || currentUser?.username === 'admin';
+  const isAdmin = currentUser?.role === UserRole.STOCKIST;
 
-  // --- USER MGMT (MASTER) ---
+  // Garante redirecionamento caso um usuário não administrador tente permanecer em aba administrativa
+  useEffect(() => {
+    if (isLoggedIn && currentUser && !isAdmin && (activeTab === 'users' || activeTab === 'config')) {
+      setActiveTab('dashboard');
+    }
+  }, [isLoggedIn, currentUser, isAdmin, activeTab]);
+
+  // --- USER MGMT (MASTER - RESTRITO AO ADMIN) ---
   const handleRefreshUsers = async (showNotification = true) => {
+    if (!isAdmin) return;
     if (!supabaseService.isAvailable()) {
       if (showNotification) showAlert("Aviso", "Supabase não está configurado. Verifique as credenciais no arquivo .env.", "info");
       return;
     }
     setIsSyncing(true);
     try {
-      const fetched = await supabaseService.getUsers();
+      const fetched = await supabaseService.getUsers(currentTenant.id);
       if (fetched && fetched.length > 0) {
         setUsers(prev => {
           const map = new Map<string, User>();
@@ -1542,8 +1729,8 @@ const App: React.FC = () => {
   };
 
   useEffect(() => {
-    if (activeTab === 'users' && supabaseService.isAvailable()) {
-      supabaseService.getUsers().then(fetched => {
+    if (isLoggedIn && isAdmin && activeTab === 'users' && supabaseService.isAvailable()) {
+      supabaseService.getUsers(currentTenant.id).then(fetched => {
         if (fetched && fetched.length > 0) {
           setUsers(prev => {
             const map = new Map<string, User>();
@@ -1556,9 +1743,17 @@ const App: React.FC = () => {
         console.warn("Aviso ao auto-carregar funcionários do Supabase:", err);
       });
     }
-  }, [activeTab]);
+  }, [activeTab, isAdmin, isLoggedIn, currentTenant.id]);
 
   const deleteUser = async (id: string) => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem excluir funcionários.", "error");
+      return;
+    }
+    if (currentUser?.id === id) {
+      showAlert("Operação Bloqueada", "Você não pode excluir o próprio usuário que está conectado no momento.", "error");
+      return;
+    }
     showConfirm(
       "Confirmar Exclusão",
       "Esta ação apagará o acesso deste funcionário permanentemente. Confirmar?",
@@ -1566,37 +1761,68 @@ const App: React.FC = () => {
         setUsers(prev => prev.filter(u => u.id !== id));
         if (supabaseService.isAvailable()) {
           try {
-            await supabaseService.deleteUser(id);
-          } catch (err) {
+            await supabaseService.adminDeleteStaff(id);
+          } catch (err: any) {
             console.error("Erro ao deletar usuário no Supabase", err);
+            showAlert("Erro", err?.message || "Não foi possível excluir o funcionário no Supabase.", "error");
           }
         }
       }
     );
   };
 
-  const resetPassword = async (id: string) => {
-    const newPass = prompt("Digite a nova senha para este usuário:");
-    if (newPass) {
-      const user = users.find(u => u.id === id);
-      if (!user) return;
-      
-      const updatedUser = { ...user, password: newPass };
-      setUsers(prev => prev.map(u => u.id === id ? updatedUser : u));
-      
-      if (supabaseService.isAvailable()) {
-        try {
-          await supabaseService.saveUser(updatedUser);
-        } catch (err) {
-          console.error("Erro ao resetar senha no Supabase", err);
-        }
-      }
-      showAlert("Sucesso", "Senha redefinida com sucesso.", "success");
+  const resetPassword = (id: string) => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem redefinir senhas.", "error");
+      return;
     }
+    const targetUser = users.find(u => u.id === id);
+    if (!targetUser) return;
+    setPasswordResetModal({
+      isOpen: true,
+      userId: id,
+      userName: targetUser.name || targetUser.username,
+      newPassword: ''
+    });
+  };
+
+  const handleConfirmPasswordReset = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isAdmin || !passwordResetModal.userId) return;
+    const trimmedPass = passwordResetModal.newPassword.trim();
+    if (trimmedPass.length < 4) {
+      showAlert("Senha Inválida", "A nova senha deve conter pelo menos 4 caracteres.", "error");
+      return;
+    }
+
+    const targetUser = users.find(u => u.id === passwordResetModal.userId);
+    if (!targetUser) return;
+
+    setPasswordResetModal({ isOpen: false, userId: null, userName: '', newPassword: '' });
+
+    if (supabaseService.isAvailable()) {
+      try {
+        await supabaseService.adminResetStaffPassword(targetUser, trimmedPass);
+        const refreshed = await supabaseService.getUsers(currentTenant.id);
+        if (refreshed.length > 0) setUsers(refreshed);
+      } catch (err: any) {
+        console.error("Erro ao resetar senha no Supabase", err);
+        showAlert("Erro", err?.message || "Não foi possível atualizar a senha no Supabase.", "error");
+        return;
+      }
+    } else {
+      const updatedUser = { ...targetUser, password: trimmedPass };
+      setUsers(prev => prev.map(u => u.id === updatedUser.id ? updatedUser : u));
+    }
+    showAlert("Sucesso", "Senha redefinida com sucesso.", "success");
   };
 
   const handleAddUser = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem cadastrar funcionários.", "error");
+      return;
+    }
     if (!userFormData.name.trim() || !userFormData.username.trim() || !userFormData.password.trim()) {
       showAlert("Erro", "Nome completo, ID de usuário e senha inicial são obrigatórios.", "error");
       return;
@@ -1618,25 +1844,38 @@ const App: React.FC = () => {
       tenantId: currentTenant.id
     };
 
-    setUsers(prev => [...prev, newUser]);
-    setIsAddingUser(false);
-    setUserFormData({
-      name: '',
-      username: '',
-      password: '',
-      role: UserRole.MECHANIC,
-      email: ''
-    });
-
     if (supabaseService.isAvailable()) {
       try {
-        await supabaseService.saveUser(newUser);
+        await supabaseService.adminCreateStaff(newUser);
+        const refreshed = await supabaseService.getUsers(currentTenant.id);
+        if (refreshed.length > 0) {
+          setUsers(refreshed);
+        } else {
+          setUsers(prev => [...prev, { ...newUser, password: undefined }]);
+        }
+        setIsAddingUser(false);
+        setUserFormData({
+          name: '',
+          username: '',
+          password: '',
+          role: UserRole.MECHANIC,
+          email: ''
+        });
         showAlert("Sucesso", "Funcionário registrado e sincronizado com o Supabase!", "success");
       } catch (err: any) {
         console.error("Erro ao salvar funcionário no Supabase", err);
-        showAlert("Sucesso Local", `Funcionário cadastrado localmente. Erro de sincronização: ${err.message}`, "info");
+        showAlert("Erro ao Cadastrar", `Não foi possível cadastrar no Supabase: ${err.message}`, "error");
       }
     } else {
+      setUsers(prev => [...prev, newUser]);
+      setIsAddingUser(false);
+      setUserFormData({
+        name: '',
+        username: '',
+        password: '',
+        role: UserRole.MECHANIC,
+        email: ''
+      });
       showAlert("Sucesso", "Funcionário cadastrado com sucesso localmente!", "success");
     }
   };
@@ -2718,6 +2957,10 @@ const App: React.FC = () => {
   };
 
   const deleteOS = async (osId: string) => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem excluir Ordens de Serviço.", "error");
+      return;
+    }
     showConfirm(
       "Confirmar Exclusão de O.S.",
       "Deseja realmente excluir esta Ordem de Serviço permanentemente?",
@@ -2828,7 +3071,7 @@ const App: React.FC = () => {
     
     if (supabaseService.isAvailable()) {
       try {
-        await supabaseService.saveClient(newClient);
+        await supabaseService.syncClientAuthAccount(newClient);
         if (createdPassport) {
           await supabaseService.saveUTVPassport(createdPassport);
         }
@@ -2891,7 +3134,7 @@ const App: React.FC = () => {
 
     if (supabaseService.isAvailable()) {
       try {
-        await supabaseService.saveClient(updatedClient);
+        await supabaseService.syncClientAuthAccount(updatedClient);
         showAlert("Sucesso", "Cadastro e credenciais de acesso do cliente atualizados no Supabase!", "success");
       } catch (err: any) {
         console.error("Erro ao atualizar cliente no Supabase", err);
@@ -2910,7 +3153,7 @@ const App: React.FC = () => {
     setClients(prev => prev.map(c => c.id === updatedClient.id ? updatedClient : c));
     if (supabaseService.isAvailable()) {
       try {
-        await supabaseService.saveClient(updatedClient);
+        await supabaseService.syncClientAuthAccount(updatedClient);
       } catch {}
     }
   };
@@ -2943,6 +3186,10 @@ const App: React.FC = () => {
   };
 
   const handleDeleteClient = (clientId: string) => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem remover clientes definitivamente.", "error");
+      return;
+    }
     showConfirm(
       "Confirmar Exclusão",
       "Deseja realmente remover este cliente?",
@@ -2950,7 +3197,7 @@ const App: React.FC = () => {
         setClients(prev => prev.filter(c => c.id !== clientId));
         if (supabaseService.isAvailable()) {
           try {
-            await supabaseService.deleteClient(clientId);
+            await supabaseService.adminDeleteClientAuth(clientId);
             showAlert("Sucesso", "Cliente removido e sincronizado com o Supabase.", "success");
           } catch (err: any) {
             console.error("Erro ao deletar cliente no Supabase:", err);
@@ -4183,42 +4430,17 @@ const App: React.FC = () => {
   // --- AI ACTIONS ---
   const fetchBRPData = async () => {
     if (!formData.partNumber) return;
-    setIsAiLoading(true);
-    try {
-      const apiKey = (typeof process !== 'undefined' && process.env?.API_KEY) || (import.meta as any).env?.VITE_GEMINI_API_KEY || '';
-      if (!apiKey) {
-        showAlert("Aviso", "Identificação automática offline: digite a descrição da peça manualmente.", "info");
-        return;
-      }
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `Identifique a peça BRP para o Part Number: ${formData.partNumber}. Forneça nome comercial curto e categoria.`,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              name: { type: Type.STRING },
-              category: { type: Type.STRING, enum: CATEGORIES }
-            },
-            required: ["name", "category"]
-          }
-        }
-      });
-      const data = JSON.parse(response.text || '{}');
-      setFormData(prev => ({ ...prev, name: data.name || prev.name, category: data.category as any || prev.category }));
-    } catch (e) { 
-      console.error(e); 
-      showAlert("Aviso", "Não foi possível consultar automaticamente o Part Number.", "info");
-    } finally { 
-      setIsAiLoading(false); 
-    }
+    setIsAiLoading(false);
+    showAlert("Aviso", "Identificação automática offline: digite a descrição da peça manualmente.", "info");
   };
 
   // --- ITEM ACTIONS ---
   const handleAddItem = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem cadastrar novas peças.", "error");
+      return;
+    }
     const newItem: InventoryItem = { 
       id: generateId(), 
       ...formData, 
@@ -4282,6 +4504,10 @@ const App: React.FC = () => {
   };
 
   const handleDeleteItem = async (id: string) => {
+    if (!isAdmin) {
+      showAlert("Acesso Restrito", "Apenas administradores podem excluir itens do estoque.", "error");
+      return;
+    }
     showConfirm(
       "Confirmar Exclusão",
       "Deseja realmente excluir este item do inventário? Esta ação é irreversível.",
@@ -4498,11 +4724,19 @@ const App: React.FC = () => {
   };
 
   const handleStartEditItem = (item: InventoryItem) => {
+    if (!isAdmin) {
+      showAlert("Acesso Negado", "Apenas administradores ou estoquistas podem editar o cadastro de peças.", "error");
+      return;
+    }
     setEditingItem({ ...item, unit: item.unit || 'un' });
   };
 
   const handleSaveEditedItem = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin) {
+      showAlert("Acesso Negado", "Apenas administradores ou estoquistas podem editar o cadastro de peças.", "error");
+      return;
+    }
     if (!editingItem) return;
     if (!editingItem.name.trim() || !editingItem.partNumber.trim()) {
       showAlert("Erro", "Nome da peça e Part Number são obrigatórios.", "error");
@@ -4815,16 +5049,23 @@ const App: React.FC = () => {
   }, [items, labelSearchTerm]);
 
   const buildLabelsPrintHtml = (targetItems: InventoryItem[]) => {
-    const tenantName = (currentTenant?.name || 'HPS CONTROL').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const escapeHtml = (val: string) =>
+      String(val ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    const tenantName = escapeHtml(currentTenant?.name || 'HPS CONTROL');
     const nowStr = new Date().toLocaleString('pt-BR');
     const cardsHtml = targetItems.map(item => {
       const qrValue = (item.linkedQRCode || item.partNumber || item.id || '').trim();
       const qrImgUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=4&data=${encodeURIComponent(qrValue)}`;
-      const safeName = (item.name || 'PEÇA S/ NOME').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      const safePN = (item.partNumber || 'S/ REF').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      const safeBox = (item.boxNumber || 'S/ LOC').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      const safeCat = (item.category || 'GERAL').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      const safeQrText = qrValue.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const safeName = escapeHtml(item.name || 'PEÇA S/ NOME');
+      const safePN = escapeHtml(item.partNumber || 'S/ REF');
+      const safeBox = escapeHtml(item.boxNumber || 'S/ LOC');
+      const safeCat = escapeHtml(item.category || 'GERAL');
+      const safeQrText = escapeHtml(qrValue);
 
       return `
         <div class="label-card">
@@ -5126,11 +5367,22 @@ const App: React.FC = () => {
   }, [users, userSearchTerm, userRoleFilter]);
 
   const targetPublicPassportFromUrl = publicClientPassportId
-    ? (utvPassports.find(
-        p => p.id === publicClientPassportId || p.qrCode.toUpperCase() === publicClientPassportId.toUpperCase()
-      ) || DEFAULT_UTV_PASSPORTS.find(
-        p => p.id === publicClientPassportId || p.qrCode.toUpperCase() === publicClientPassportId.toUpperCase()
-      ) || null)
+    ? (
+        (publicPreviewPassport &&
+        (publicPreviewPassport.id === publicClientPassportId ||
+          publicPreviewPassport.qrCode.toUpperCase() === publicClientPassportId.toUpperCase())
+          ? publicPreviewPassport
+          : null) ||
+        utvPassports.find(
+          p => p.id === publicClientPassportId || p.qrCode.toUpperCase() === publicClientPassportId.toUpperCase()
+        ) ||
+        (!supabaseService.isAvailable()
+          ? DEFAULT_UTV_PASSPORTS.find(
+              p => p.id === publicClientPassportId || p.qrCode.toUpperCase() === publicClientPassportId.toUpperCase()
+            )
+          : null) ||
+        null
+      )
     : null;
 
   if (!isLoggedIn) {
@@ -5176,7 +5428,7 @@ const App: React.FC = () => {
                 value={loginForm.username}
                 onChange={e => setLoginForm({...loginForm, username: e.target.value})}
                 required
-                placeholder={publicClientPassportId ? 'Ex: guilherme' : 'admin ou login do cliente'}
+                placeholder={publicClientPassportId ? 'Seu login de cliente' : 'Seu usuário ou login de cliente'}
               />
             </div>
             <div className="space-y-2">
@@ -5205,57 +5457,6 @@ const App: React.FC = () => {
               )}
             </button>
           </form>
-
-          {/* Atalhos Rápidos para Testes */}
-          <div className="mt-6 pt-4 border-t border-zinc-800/80 space-y-2.5">
-            <p className="text-[9px] font-black uppercase text-zinc-400 text-center tracking-wider">
-              ⚡ Acesso Rápido para Iniciar Testes:
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setLoginForm({ username: 'admin', password: 'admin' });
-                }}
-                className="p-2.5 bg-zinc-800/80 hover:bg-zinc-700 border border-zinc-700 rounded-xl text-left transition-all group"
-              >
-                <div className="flex items-center gap-1 text-green-400 text-[9px] font-black uppercase">
-                  <span>👑 Admin</span>
-                </div>
-                <div className="text-[8px] text-zinc-400 font-mono mt-0.5">
-                  admin / admin
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setLoginForm({ username: 'carlos', password: '123' });
-                }}
-                className="p-2.5 bg-zinc-800/80 hover:bg-zinc-700 border border-zinc-700 rounded-xl text-left transition-all group"
-              >
-                <div className="flex items-center gap-1 text-blue-400 text-[9px] font-black uppercase">
-                  <span>🔧 Mecânico</span>
-                </div>
-                <div className="text-[8px] text-zinc-400 font-mono mt-0.5">
-                  carlos / 123
-                </div>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setLoginForm({ username: 'guilherme', password: '123' });
-                }}
-                className="p-2.5 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 rounded-xl text-left transition-all group"
-              >
-                <div className="flex items-center gap-1 text-emerald-400 text-[9px] font-black uppercase">
-                  <span>🏁 Cliente UTV</span>
-                </div>
-                <div className="text-[8px] text-zinc-300 font-mono mt-0.5">
-                  guilherme / 123
-                </div>
-              </button>
-            </div>
-          </div>
 
           <div className="mt-6 flex flex-col items-center gap-2 border-t border-zinc-800/50 pt-4">
             <div className="flex items-center gap-2">
@@ -5300,7 +5501,7 @@ const App: React.FC = () => {
   // TRAVA ABSOLUTA DE SEGURANÇA PARA CLIENTES (UserRole.CLIENT):
   // O cliente logado fica 100% restrito à visualização do Espelho do Cliente (sem menu lateral, sem edição e sem navegação pelo sistema)
   if (currentUser?.role === UserRole.CLIENT) {
-    const allPassports = utvPassports.length > 0 ? utvPassports : DEFAULT_UTV_PASSPORTS;
+    const allPassports = utvPassports.length > 0 ? utvPassports : (!supabaseService.isAvailable() ? DEFAULT_UTV_PASSPORTS : []);
     const clientLinkedPassports = allPassports.filter(
       p =>
         (currentUser.clientId && p.clientId === currentUser.clientId) ||
@@ -5372,7 +5573,7 @@ const App: React.FC = () => {
         items={items}
         tenant={currentTenant}
         isPublicStandalone={true}
-        clientCredentials={ownerClient ? { username: ownerClient.username, password: ownerClient.password, clientName: ownerClient.name } : undefined}
+        clientCredentials={isAdmin && ownerClient ? { username: ownerClient.username, password: ownerClient.password, clientName: ownerClient.name } : undefined}
         onClose={() => {
           const url = new URL(window.location.href);
           url.searchParams.delete('utv_passport');
@@ -5403,8 +5604,10 @@ const App: React.FC = () => {
             { id: 'history', label: 'Movimentações & Auditoria', short: 'Auditoria', icon: FileSpreadsheet },
             { id: 'analytics', label: 'Analytics', short: 'Dash', icon: BarChart3 },
             { id: 'labels', label: 'Etiquetas QR', short: 'Etiquetas', icon: QrCode },
-            { id: 'users', label: 'Equipe', short: 'Equipe', icon: Users },
-            { id: 'config', label: 'Configurações', short: 'Config', icon: Settings },
+            ...(isAdmin ? [
+              { id: 'users', label: 'Equipe', short: 'Equipe', icon: Users },
+              { id: 'config', label: 'Configurações', short: 'Config', icon: Settings },
+            ] : []),
           ].map(tab => (
             <button 
               key={tab.id} 
@@ -5460,6 +5663,7 @@ const App: React.FC = () => {
 
           <div className="flex flex-wrap items-center gap-2 sm:gap-3">
             {/* Seletor Multi-Tenant de Oficina */}
+            {isAdmin ? (
             <div className="relative">
               <button
                 type="button"
@@ -5536,6 +5740,14 @@ const App: React.FC = () => {
                 </div>
               )}
             </div>
+            ) : (
+            <div className="px-3 py-1.5 bg-zinc-900 border border-zinc-800 rounded-xl flex items-center gap-2">
+              <Building2 size={15} className="text-blue-400 shrink-0" />
+              <span className="text-[10px] font-black uppercase text-white truncate max-w-[140px]">
+                {currentTenant.name}
+              </span>
+            </div>
+            )}
 
             <div className="px-3 py-1.5 bg-zinc-900 border border-zinc-800 rounded-xl flex items-center gap-2">
               <div className="w-2 h-2 rounded-full bg-green-500"></div>
@@ -5550,8 +5762,9 @@ const App: React.FC = () => {
             <button
               type="button"
               onClick={() => {
-                setOsFormData({ customerName: '', vehicleModel: '', observations: '', laborTemplateId: '', clientId: '', vehicleId: '', mechanicId: '' });
+                setOsFormData({ customerName: '', vehicleModel: '', observations: '', laborTemplateId: '', clientId: '', vehicleId: '', mechanicId: '', passportId: '' });
                 setOsLaborList([]);
+                setOsInitialPartsList([]);
                 setIsAddingCustomLabor(false);
                 setIsAddingOS(true);
               }}
@@ -5581,8 +5794,10 @@ const App: React.FC = () => {
               { id: 'history', label: 'Auditoria', icon: FileSpreadsheet },
               { id: 'analytics', label: 'Dashboards', icon: BarChart3 },
               { id: 'labels', label: 'Etiquetas QR', icon: QrCode },
-              { id: 'users', label: 'Equipe', icon: Users },
-              { id: 'config', label: 'Config', icon: Settings },
+              ...(isAdmin ? [
+                { id: 'users', label: 'Equipe', icon: Users },
+                { id: 'config', label: 'Config', icon: Settings },
+              ] : []),
             ].map(tab => (
               <button
                 key={tab.id}
@@ -5638,7 +5853,7 @@ const App: React.FC = () => {
           </div>
           
           <div className="flex flex-wrap items-center gap-2 sm:gap-3">
-            {supabaseService.isAvailable() && (
+            {isAdmin && supabaseService.isAvailable() && (
               <>
                 <button 
                   type="button"
@@ -6404,6 +6619,7 @@ const App: React.FC = () => {
                                     </>
                                   )}
                                 </div>
+                                {isAdmin && (
                                 <button
                                   type="button"
                                   onClick={e => {
@@ -6414,6 +6630,7 @@ const App: React.FC = () => {
                                 >
                                   <Trash2 size={12} /> Excluir
                                 </button>
+                                )}
                               </div>
                             </div>
                           );
@@ -6483,14 +6700,25 @@ const App: React.FC = () => {
                          <td className="p-4 sm:p-6 lg:p-8 text-right font-black text-zinc-400 whitespace-nowrap">R$ {(item.value * item.quantity).toLocaleString('pt-BR')}</td>
                          <td className="p-4 sm:p-6 lg:p-8 text-center" onClick={e => e.stopPropagation()}>
                            <div className="flex items-center justify-center gap-2">
-                             <button 
-                               type="button" 
-                               onClick={() => handleStartEditItem(item)} 
-                               className="px-3 py-1.5 bg-zinc-800 hover:bg-green-500 hover:text-black rounded-xl text-[9px] font-black uppercase transition-all flex items-center gap-1.5 text-zinc-300 shadow-md active:scale-95"
-                               title="Editar Cadastro da Peça"
-                             >
-                               <Pencil size={12} /> Editar
-                             </button>
+                             {isAdmin ? (
+                               <button 
+                                 type="button" 
+                                 onClick={() => handleStartEditItem(item)} 
+                                 className="px-3 py-1.5 bg-zinc-800 hover:bg-green-500 hover:text-black rounded-xl text-[9px] font-black uppercase transition-all flex items-center gap-1.5 text-zinc-300 shadow-md active:scale-95"
+                                 title="Editar Cadastro da Peça"
+                               >
+                                 <Pencil size={12} /> Editar
+                               </button>
+                             ) : (
+                               <button 
+                                 type="button" 
+                                 onClick={() => setSelectedItem(item)} 
+                                 className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 rounded-xl text-[9px] font-black uppercase transition-all flex items-center gap-1.5 text-zinc-300 shadow-md active:scale-95"
+                                 title="Visualizar Detalhes da Peça"
+                               >
+                                 <Eye size={12} /> Detalhes
+                               </button>
+                             )}
                            </div>
                          </td>
                        </tr>
@@ -6994,9 +7222,11 @@ const App: React.FC = () => {
                               <button onClick={() => handleStartEditClient(client)} className="flex-1 sm:flex-initial justify-center px-4 sm:px-5 py-3 bg-zinc-800 border border-zinc-700 hover:bg-green-500 hover:text-black transition-all rounded-xl text-[8px] font-black uppercase text-zinc-300 flex items-center gap-2">
                                 <Pencil size={12} /> Editar / Credenciais
                               </button>
-                              <button onClick={() => handleDeleteClient(client.id)} className="flex-1 sm:flex-initial justify-center px-4 sm:px-5 py-3 bg-red-500/10 border border-red-500/20 hover:bg-red-500 hover:text-white transition-all rounded-xl text-[8px] font-black uppercase text-red-500 flex items-center gap-2">
-                                <Trash2 size={12} /> Remover Cliente
-                              </button>
+                              {isAdmin && (
+                                <button onClick={() => handleDeleteClient(client.id)} className="flex-1 sm:flex-initial justify-center px-4 sm:px-5 py-3 bg-red-500/10 border border-red-500/20 hover:bg-red-500 hover:text-white transition-all rounded-xl text-[8px] font-black uppercase text-red-500 flex items-center gap-2">
+                                  <Trash2 size={12} /> Remover Cliente
+                                </button>
+                              )}
                             </div>
                          </div>
 
@@ -7148,7 +7378,7 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {activeTab === 'users' && (
+        {activeTab === 'users' && isAdmin && (
           <div className="space-y-8 animate-in fade-in">
              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800 pb-6">
                 <div>
@@ -7675,7 +7905,7 @@ const App: React.FC = () => {
           </div>
         )}
 
-        {activeTab === 'config' && (
+        {activeTab === 'config' && isAdmin && (
           <div className="space-y-12 animate-in fade-in duration-500 pb-20">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-zinc-800 pb-8">
                <div>
@@ -9277,6 +9507,16 @@ const App: React.FC = () => {
 
                     {diagReport && (
                       <div className="space-y-4">
+                        {authEdgeStatus && (
+                          <div className={`p-3 rounded-xl border text-[11px] flex items-center justify-between gap-2 ${authEdgeStatus.available ? 'bg-green-500/10 border-green-500/30 text-green-300' : 'bg-amber-500/10 border-amber-500/30 text-amber-300'}`}>
+                            <span>
+                              <strong>Supabase Auth / Edge Function:</strong> {authEdgeStatus.message}
+                            </span>
+                            <span className="px-2 py-0.5 rounded bg-black/40 font-mono text-[9px] uppercase shrink-0">
+                              {authEdgeStatus.available ? 'JWT ATIVO' : 'MODO TRANSIÇÃO'}
+                            </span>
+                          </div>
+                        )}
                         <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono bg-zinc-950 border border-zinc-800 rounded-xl p-3 text-zinc-400">
                           <div className="flex flex-wrap gap-x-4 gap-y-1">
                             <span>Site: <strong className="text-white">{typeof window !== 'undefined' ? window.location.host : '-'}</strong></span>
@@ -12890,9 +13130,11 @@ const App: React.FC = () => {
 
               {/* Ações Finais */}
               <div className="flex flex-col sm:flex-row gap-3 pb-8">
+                 {isAdmin && (
                  <button onClick={() => deleteOS(selectedOS.id)} className="flex-1 py-4 bg-red-500/10 border border-red-500/20 text-red-400 font-black uppercase text-[10px] rounded-xl hover:bg-red-500 hover:text-white transition-all flex items-center justify-center gap-2">
                    <Trash2 size={15} /> Excluir O.S. Definitivamente
                  </button>
+                 )}
                  <button onClick={() => setShowOSDocumentPreview(true)} className="flex-1 py-4 bg-green-500 text-black font-black uppercase text-[10px] rounded-xl shadow-glow hover:bg-green-400 active:scale-95 transition-all flex items-center justify-center gap-2">
                    <FileText size={15} /> Relatório Técnico / Salvar PDF
                  </button>
@@ -13113,6 +13355,7 @@ const App: React.FC = () => {
                  <span className="text-sm sm:text-lg font-black text-zinc-400 uppercase tracking-tighter italic">Endereço: {selectedItem.boxNumber}</span>
               </div>
               <div className="flex items-center gap-3">
+                {isAdmin && (
                 <button 
                   type="button" 
                   onClick={() => handleStartEditItem(selectedItem)} 
@@ -13120,6 +13363,7 @@ const App: React.FC = () => {
                 >
                   <Pencil size={14} /> Editar Cadastro
                 </button>
+                )}
                 <button onClick={() => setSelectedItem(null)} className="p-3 sm:p-5 bg-zinc-800 rounded-xl sm:rounded-[2rem] text-zinc-500 hover:text-white transition-colors"><X size={20} /></button>
               </div>
             </header>
@@ -13790,7 +14034,7 @@ const App: React.FC = () => {
             passport={clientMirrorPassport}
             items={items}
             tenant={currentTenant}
-            clientCredentials={ownerClient ? { username: ownerClient.username, password: ownerClient.password, clientName: ownerClient.name } : undefined}
+            clientCredentials={isAdmin && ownerClient ? { username: ownerClient.username, password: ownerClient.password, clientName: ownerClient.name } : undefined}
             onClose={() => setClientMirrorPassport(null)}
           />
         );
@@ -13991,8 +14235,63 @@ const App: React.FC = () => {
         </div>
       )}
 
+      {/* MODAL REDEFINIÇÃO DE SENHA DE FUNCIONÁRIO */}
+      {passwordResetModal.isOpen && isAdmin && (
+        <div className="fixed inset-0 bg-black/90 z-[1000] flex items-center justify-center p-4 backdrop-blur-md animate-in fade-in duration-300">
+          <div className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full max-w-md shadow-2xl overflow-hidden">
+            <div className="p-6 bg-zinc-950 border-b border-zinc-800 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-green-500/10 text-green-500 rounded-xl">
+                  <Key size={20} />
+                </div>
+                <div>
+                  <h3 className="text-base font-black uppercase italic tracking-tight text-white">Redefinir Senha</h3>
+                  <p className="text-[10px] text-zinc-400 font-bold uppercase">{passwordResetModal.userName}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPasswordResetModal({ isOpen: false, userId: null, userName: '', newPassword: '' })}
+                className="p-2 text-zinc-400 hover:text-white rounded-xl hover:bg-zinc-800 transition-colors"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <form onSubmit={handleConfirmPasswordReset} className="p-6 space-y-5">
+              <div className="space-y-2">
+                <label className="text-[9px] font-black uppercase text-zinc-400 tracking-wider">Nova Senha de Acesso *</label>
+                <input
+                  type="password"
+                  required
+                  autoFocus
+                  placeholder="Digite a nova senha (mín. 4 caracteres)"
+                  value={passwordResetModal.newPassword}
+                  onChange={e => setPasswordResetModal(prev => ({ ...prev, newPassword: e.target.value }))}
+                  className="w-full bg-black border border-zinc-800 focus:border-green-500 p-4 rounded-xl text-white font-bold text-sm outline-none transition-colors"
+                />
+              </div>
+              <div className="flex gap-3">
+                <button
+                  type="button"
+                  onClick={() => setPasswordResetModal({ isOpen: false, userId: null, userName: '', newPassword: '' })}
+                  className="flex-1 py-3.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-black uppercase text-[10px] rounded-xl transition-all"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 py-3.5 bg-green-500 hover:bg-green-400 text-black font-black uppercase text-[10px] rounded-xl shadow-glow transition-all"
+                >
+                  Salvar Nova Senha
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {/* MODAL DE SCRIPT SQL DO SUPABASE */}
-      {showSqlModal && (
+      {showSqlModal && isAdmin && (
         <div className="fixed inset-0 bg-black/90 z-[1000] flex items-center justify-center p-4 backdrop-blur-md animate-in fade-in duration-300">
           <div className="bg-zinc-900 border border-zinc-800 rounded-3xl w-full max-w-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
             <div className="p-6 bg-zinc-950 border-b border-zinc-800 flex items-center justify-between">
@@ -14015,28 +14314,52 @@ const App: React.FC = () => {
             </div>
 
             <div className="p-6 overflow-y-auto space-y-4 text-xs">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => { setSqlModalTab('schema'); setCopiedSql(false); }}
+                  className={`px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${sqlModalTab === 'schema' ? 'bg-green-500 text-black border-green-500' : 'bg-zinc-950 text-zinc-400 border-zinc-800 hover:text-white'}`}
+                >
+                  1. Script Base (Tabelas & Auth)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setSqlModalTab('rls'); setCopiedSql(false); }}
+                  className={`px-3.5 py-2 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all border ${sqlModalTab === 'rls' ? 'bg-emerald-500 text-black border-emerald-500' : 'bg-zinc-950 text-zinc-400 border-zinc-800 hover:text-white'}`}
+                >
+                  2. RLS Restritivo (Pós-Migração)
+                </button>
+              </div>
+
               <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 text-amber-300 space-y-2">
                 <p className="font-bold flex items-center gap-2">
-                  <AlertTriangle size={16} /> Como resolver os erros de Sincronização ("invalid input syntax", colunas ausentes ou tabelas pendentes):
+                  <AlertTriangle size={16} />
+                  {sqlModalTab === 'schema'
+                    ? 'Passo 1 — Script Base de Tabelas, Colunas NUMERIC e Preparação do Supabase Auth:'
+                    : 'Passo 2 — Políticas RLS Restritivas (execute somente após publicar a Edge Function e logar 1x como Admin):'}
                 </p>
                 <p className="text-[11px] text-zinc-300 leading-relaxed">
-                  O script abaixo foi atualizado com proteção total: garante que colunas como <code className="text-green-400">unitValue</code> e <code className="text-green-400">quantity</code> existam antes de serem convertidas para <strong className="text-green-400">NUMERIC</strong>, prevenindo os erros <strong className="text-amber-400">42703 (column does not exist)</strong> e <strong className="text-amber-400">22P02 (invalid input syntax for type integer: "3.3")</strong>.
+                  {sqlModalTab === 'schema'
+                    ? 'Atualiza todas as tabelas, converte colunas de quantidade/descontos para NUMERIC, criptografa senhas legadas com bcrypt e prepara as colunas authUserId/authEmail sem interromper os acessos atuais.'
+                    : 'Remove as políticas permissivas (USING true) e passa a exigir sessão autenticada no Supabase Auth, isolando dados por oficina (tenantId) e bloqueando exclusões/configurações para perfis que não sejam Administradores.'}
                 </p>
                 <ol className="list-decimal list-inside space-y-1.5 text-zinc-300 text-[11px] pt-1">
                   <li>Acesse o painel do seu projeto no Supabase: <span className="text-green-400 font-mono">app.supabase.com</span></li>
-                  <li>No menu lateral esquerdo, selecione a aba <b>SQL Editor</b></li>
-                  <li>Clique em <b>New Query</b> (ou no botão '+')</li>
-                  <li>Copie o script SQL abaixo, cole no editor e clique no botão <b>Run</b> (ou aperte Ctrl+Enter)</li>
+                  <li>No menu lateral esquerdo, selecione a aba <b>SQL Editor</b> → <b>New Query</b></li>
+                  <li>Copie o código abaixo, cole no editor e clique em <b>Run</b></li>
                 </ol>
               </div>
 
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-black uppercase text-zinc-400 tracking-wider">Script SQL de Atualização</span>
+                  <span className="text-[10px] font-black uppercase text-zinc-400 tracking-wider">
+                    {sqlModalTab === 'schema' ? 'supabase_schema.sql' : 'supabase_rls_strict.sql'}
+                  </span>
                   <button
                     type="button"
                     onClick={() => {
-                      navigator.clipboard.writeText(supabaseService.getTenantMigrationSql());
+                      const sqlText = sqlModalTab === 'schema' ? supabaseService.getTenantMigrationSql() : supabaseService.getStrictRlsSql();
+                      navigator.clipboard.writeText(sqlText);
                       setCopiedSql(true);
                       setTimeout(() => setCopiedSql(false), 2500);
                     }}
@@ -14047,7 +14370,7 @@ const App: React.FC = () => {
                   </button>
                 </div>
                 <pre className="bg-black/90 p-4 rounded-2xl border border-zinc-800 font-mono text-[10px] text-green-400 overflow-x-auto max-h-64 select-all leading-relaxed">
-                  {supabaseService.getTenantMigrationSql()}
+                  {sqlModalTab === 'schema' ? supabaseService.getTenantMigrationSql() : supabaseService.getStrictRlsSql()}
                 </pre>
               </div>
             </div>

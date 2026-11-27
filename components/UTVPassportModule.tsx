@@ -53,7 +53,7 @@ export const UTVPassportModule: React.FC<UTVPassportModuleProps> = ({
   setSelectedPassport,
   showAlert
 }) => {
-  const isAdmin = currentUser?.role === UserRole.STOCKIST || currentUser?.username === 'admin';
+  const isAdmin = currentUser?.role === UserRole.STOCKIST;
 
   const [searchTerm, setSearchTerm] = useState('');
   const [isFormModalOpen, setIsFormModalOpen] = useState(false);

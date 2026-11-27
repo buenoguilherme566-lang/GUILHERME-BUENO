@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT,
     "avatarUrl" TEXT,
     password TEXT,
-    "tenantId" TEXT DEFAULT 'tenant_matriz_hps'
+    "tenantId" TEXT DEFAULT 'tenant_matriz_hps',
+    "authUserId" UUID,
+    "authEmail" TEXT
 );
 
 -- 1.4 Itens de Estoque / Inventário
@@ -159,7 +161,9 @@ CREATE TABLE IF NOT EXISTS clients (
     "isAccessActive" BOOLEAN DEFAULT true,
     vehicles JSONB DEFAULT '[]'::jsonb,
     "createdAt" TEXT NOT NULL,
-    "tenantId" TEXT DEFAULT 'tenant_matriz_hps'
+    "tenantId" TEXT DEFAULT 'tenant_matriz_hps',
+    "authUserId" UUID,
+    "authEmail" TEXT
 );
 
 -- 1.10 Logs de Auditoria de Acesso ao Espelho do Cliente
@@ -238,6 +242,8 @@ ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS email TEXT;
 ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "avatarUrl" TEXT;
 ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS password TEXT;
 ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "tenantId" TEXT DEFAULT 'tenant_matriz_hps';
+ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "authUserId" UUID;
+ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS "authEmail" TEXT;
 
 -- items
 ALTER TABLE IF EXISTS items ADD COLUMN IF NOT EXISTS quantity NUMERIC DEFAULT 0;
@@ -307,6 +313,8 @@ ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS password TEXT;
 ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "isAccessActive" BOOLEAN DEFAULT true;
 ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS vehicles JSONB DEFAULT '[]'::jsonb;
 ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "tenantId" TEXT DEFAULT 'tenant_matriz_hps';
+ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "authUserId" UUID;
+ALTER TABLE IF EXISTS clients ADD COLUMN IF NOT EXISTS "authEmail" TEXT;
 
 -- vehicle_sections
 ALTER TABLE IF EXISTS vehicle_sections ADD COLUMN IF NOT EXISTS "tenantId" TEXT DEFAULT 'tenant_matriz_hps';
@@ -338,6 +346,9 @@ DO $$ BEGIN ALTER TABLE items ALTER COLUMN "minQuantity" TYPE NUMERIC USING "min
 DO $$ BEGIN ALTER TABLE items ALTER COLUMN value TYPE NUMERIC USING value::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE history ALTER COLUMN quantity TYPE NUMERIC USING quantity::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE history ALTER COLUMN "unitValue" TYPE NUMERIC USING "unitValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE history ALTER COLUMN "originalUnitValue" TYPE NUMERIC USING "originalUnitValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE history ALTER COLUMN "discountValue" TYPE NUMERIC USING "discountValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
+DO $$ BEGIN ALTER TABLE history ALTER COLUMN "discountPercentage" TYPE NUMERIC USING "discountPercentage"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE labor_templates ALTER COLUMN "defaultHours" TYPE NUMERIC USING "defaultHours"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE labor_templates ALTER COLUMN "defaultValuePerHour" TYPE NUMERIC USING "defaultValuePerHour"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
 DO $$ BEGIN ALTER TABLE labor_templates ALTER COLUMN "fixedValue" TYPE NUMERIC USING "fixedValue"::numeric; EXCEPTION WHEN OTHERS THEN NULL; END $$;
@@ -372,6 +383,8 @@ CREATE INDEX IF NOT EXISTS idx_clients_tenant ON clients("tenantId");
 CREATE INDEX IF NOT EXISTS idx_clients_username ON clients(username);
 CREATE INDEX IF NOT EXISTS idx_utv_passports_tenant ON utv_passports("tenantId");
 CREATE INDEX IF NOT EXISTS idx_client_mirror_logs_client ON client_mirror_access_logs("clientId");
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_auth_user_id ON users("authUserId") WHERE "authUserId" IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_auth_user_id ON clients("authUserId") WHERE "authUserId" IS NOT NULL;
 
 -- ============================================================================
 -- 6. SEGURANÇA, HASHING DE SENHAS E FUNÇÕES RPC (EQUIPE + ESPELHO DO CLIENTE)
@@ -380,8 +393,9 @@ CREATE INDEX IF NOT EXISTS idx_client_mirror_logs_client ON client_mirror_access
 -- Impedir leitura direta da coluna password da tabela users por clientes anônimos mantendo permissões de upsert
 GRANT USAGE ON SCHEMA public TO anon, authenticated;
 GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated;
+REVOKE SELECT ON users FROM anon, authenticated;
 REVOKE SELECT (password) ON users FROM anon, authenticated;
-GRANT SELECT (id, username, name, role, email, "avatarUrl", "tenantId"), INSERT, UPDATE, DELETE ON users TO anon, authenticated;
+GRANT SELECT (id, username, name, role, email, "avatarUrl", "tenantId", "authUserId", "authEmail"), INSERT, UPDATE, DELETE ON users TO anon, authenticated;
 
 -- Gatilho para hashing automático de senhas de funcionários (bcrypt)
 CREATE OR REPLACE FUNCTION hash_user_password()
@@ -398,6 +412,14 @@ DROP TRIGGER IF EXISTS trg_hash_password ON users;
 CREATE TRIGGER trg_hash_password
 BEFORE INSERT OR UPDATE ON users
 FOR EACH ROW EXECUTE FUNCTION hash_user_password();
+
+-- Criptografar automaticamente quaisquer senhas legadas em texto puro na tabela users
+UPDATE users
+SET password = crypt(password, gen_salt('bf', 8))
+WHERE password IS NOT NULL
+  AND password <> ''
+  AND password NOT LIKE '$2a$%'
+  AND password NOT LIKE '$2b$%';
 
 -- RPC 1: Autenticação segura da Equipe (Admin / Estoque / Mecânicos)
 DROP FUNCTION IF EXISTS login_user(TEXT, TEXT);
@@ -437,6 +459,143 @@ AS $$
     AND COALESCE("isAccessActive", true) = true
   LIMIT 1;
 $$;
+
+-- RPC 3: Perfil autenticado via Supabase Auth (auth.uid())
+DROP FUNCTION IF EXISTS get_my_app_profile();
+CREATE OR REPLACE FUNCTION get_my_app_profile()
+RETURNS TABLE (
+    "accountType" TEXT,
+    id TEXT,
+    username TEXT,
+    name TEXT,
+    role TEXT,
+    email TEXT,
+    "avatarUrl" TEXT,
+    "tenantId" TEXT,
+    "clientId" TEXT,
+    "isAccessActive" BOOLEAN
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF auth.uid() IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        'STAFF'::text,
+        u.id,
+        u.username,
+        u.name,
+        u.role,
+        u.email,
+        u."avatarUrl",
+        COALESCE(u."tenantId", 'tenant_matriz_hps'),
+        NULL::text,
+        true
+    FROM public.users u
+    WHERE u."authUserId" = auth.uid()
+    LIMIT 1;
+
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT
+        'CLIENT'::text,
+        c.id,
+        COALESCE(c.username, c.id),
+        c.name,
+        'CLIENT'::text,
+        c.email,
+        NULL::text,
+        COALESCE(c."tenantId", 'tenant_matriz_hps'),
+        c.id,
+        COALESCE(c."isAccessActive", true)
+    FROM public.clients c
+    WHERE c."authUserId" = auth.uid()
+    LIMIT 1;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION get_my_app_profile() TO authenticated;
+
+-- RPC 4: Resolver e-mail de login no Supabase Auth a partir do usuário curto (somente usuários já migrados)
+DROP FUNCTION IF EXISTS resolve_auth_login(TEXT);
+CREATE OR REPLACE FUNCTION resolve_auth_login(p_identifier TEXT)
+RETURNS TABLE (
+    "authEmail" TEXT,
+    "accountType" TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    clean_id TEXT := LOWER(TRIM(COALESCE(p_identifier, '')));
+BEGIN
+    IF clean_id = '' THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT u."authEmail", 'STAFF'::text
+    FROM public.users u
+    WHERE u."authUserId" IS NOT NULL
+      AND u."authEmail" IS NOT NULL
+      AND (LOWER(TRIM(u.username)) = clean_id OR (clean_id LIKE '%@%' AND LOWER(TRIM(COALESCE(u.email, ''))) = clean_id))
+    LIMIT 1;
+
+    IF FOUND THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    SELECT c."authEmail", 'CLIENT'::text
+    FROM public.clients c
+    WHERE c."authUserId" IS NOT NULL
+      AND c."authEmail" IS NOT NULL
+      AND COALESCE(c."isAccessActive", true) = true
+      AND (LOWER(TRIM(COALESCE(c.username, ''))) = clean_id OR (clean_id LIKE '%@%' AND LOWER(TRIM(COALESCE(c.email, ''))) = clean_id))
+    LIMIT 1;
+END;
+$$;
+GRANT EXECUTE ON FUNCTION resolve_auth_login(TEXT) TO anon, authenticated;
+
+-- RPC 5: Pré-visualização pública segura do cabeçalho do Passaporte UTV (para tela de login via QR)
+DROP FUNCTION IF EXISTS get_public_utv_passport_preview(TEXT);
+CREATE OR REPLACE FUNCTION get_public_utv_passport_preview(p_id_or_qr TEXT)
+RETURNS TABLE (
+    id TEXT,
+    "qrCode" TEXT,
+    "vehicleNumber" TEXT,
+    "vehicleModel" TEXT,
+    "customerName" TEXT,
+    "tenantId" TEXT,
+    "tenantName" TEXT
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    SELECT
+        p.id,
+        p."qrCode",
+        p."vehicleNumber",
+        p."vehicleModel",
+        p."customerName",
+        COALESCE(p."tenantId", 'tenant_matriz_hps'),
+        t.name
+    FROM public.utv_passports p
+    LEFT JOIN public.tenants t ON t.id = COALESCE(p."tenantId", 'tenant_matriz_hps')
+    WHERE p.id = TRIM(COALESCE(p_id_or_qr, ''))
+       OR UPPER(p."qrCode") = UPPER(TRIM(COALESCE(p_id_or_qr, '')))
+    LIMIT 1;
+$$;
+GRANT EXECUTE ON FUNCTION get_public_utv_passport_preview(TEXT) TO anon, authenticated;
 
 -- ============================================================================
 -- 7. POLÍTICAS RLS (ROW LEVEL SECURITY) PARA TODAS AS 11 TABELAS
