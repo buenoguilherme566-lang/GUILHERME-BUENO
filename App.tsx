@@ -387,6 +387,12 @@ const App: React.FC = () => {
   // --- AUTH STATE ---
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
+  const [pendingPasswordUpgrade, setPendingPasswordUpgrade] = useState<{
+    username: string;
+    currentPassword: string;
+    newPassword: string;
+    confirmPassword: string;
+  } | null>(null);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
 
   const showAlert = (title: string, message: string, type: 'success' | 'error' | 'info' = 'info') => {
@@ -1506,6 +1512,25 @@ const App: React.FC = () => {
           return;
         }
 
+        if (authAttempt.requiresPasswordUpgrade) {
+          setPendingPasswordUpgrade({
+            username: loginForm.username.trim(),
+            currentPassword: loginForm.password,
+            newPassword: '',
+            confirmPassword: ''
+          });
+          return;
+        }
+
+        if (authAttempt.gatewayJwtBlocked) {
+          showAlert(
+            "Configuração Pendente na Edge Function",
+            authAttempt.error || "Desative 'Verify JWT with legacy secret' nas configurações da Edge Function manage-auth-users no Supabase.",
+            "error"
+          );
+          return;
+        }
+
         if (authAttempt.error && !authAttempt.edgeUnavailable && authAttempt.error.toLowerCase().includes('bloqueado')) {
           showAlert(
             "Acesso Bloqueado",
@@ -1594,11 +1619,15 @@ const App: React.FC = () => {
           }
         }
 
+        const customAuthError = authAttempt.error && !/incorretos/i.test(authAttempt.error)
+          ? authAttempt.error
+          : null;
+
         showAlert(
           "Login Inválido",
-          publicClientPassportId
+          customAuthError || (publicClientPassportId
             ? "Login ou senha de cliente incorretos. Utilize as credenciais enviadas pela oficina."
-            : "Usuário ou senha incorretos. Verifique suas credenciais com o administrador da oficina.",
+            : "Usuário ou senha incorretos. Verifique suas credenciais com o administrador da oficina."),
           "error"
         );
         return;
@@ -1655,6 +1684,59 @@ const App: React.FC = () => {
       console.error("Erro inesperado no login:", error);
       const msg = error?.message || "Erro de conexão.";
       showAlert("Erro no Login", `Erro ao processar login: ${msg}. Tente novamente.`, "error");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleCompletePasswordUpgrade = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingPasswordUpgrade) return;
+    const newPass = pendingPasswordUpgrade.newPassword.trim();
+    const confirmPass = pendingPasswordUpgrade.confirmPassword.trim();
+    if (newPass.length < 6) {
+      showAlert("Senha Muito Curta", "A nova senha deve ter pelo menos 6 caracteres para o Supabase Auth.", "error");
+      return;
+    }
+    if (newPass !== confirmPass) {
+      showAlert("Senhas Diferentes", "A confirmação não confere com a nova senha digitada.", "error");
+      return;
+    }
+    setIsLoading(true);
+    try {
+      const authAttempt = await supabaseService.signInWithAuthOrMigrate(
+        pendingPasswordUpgrade.username.trim().toLowerCase(),
+        pendingPasswordUpgrade.currentPassword,
+        newPass
+      );
+      if (authAttempt.user) {
+        const loggedProfile = authAttempt.user;
+        let activeTenants = tenants;
+        try {
+          const sbTenants = await supabaseService.getTenants();
+          if (sbTenants && sbTenants.length > 0) {
+            activeTenants = sbTenants;
+            setTenants(sbTenants);
+          }
+        } catch {}
+        const targetTenant = activeTenants.find(t => t.id === loggedProfile.tenantId) || currentTenant;
+        if (targetTenant.id !== currentTenant.id) {
+          setCurrentTenant(targetTenant);
+          safeSetItem("HPS_ACTIVE_TENANT_ID", targetTenant.id);
+        }
+        const finalUser: User = loggedProfile.role === UserRole.CLIENT
+          ? { ...loggedProfile, allowedPassportId: publicClientPassportId || undefined }
+          : loggedProfile;
+        await loadTenantWorkspaceData(targetTenant, finalUser);
+        setPendingPasswordUpgrade(null);
+        setLoginForm({ username: '', password: '' });
+        setCurrentUser(finalUser);
+        setIsLoggedIn(true);
+        return;
+      }
+      showAlert("Erro ao Atualizar Senha", authAttempt.error || "Não foi possível concluir a migração da sua conta.", "error");
+    } catch (err: any) {
+      showAlert("Erro", err?.message || "Erro ao atualizar senha no Supabase Auth.", "error");
     } finally {
       setIsLoading(false);
     }
@@ -1790,8 +1872,8 @@ const App: React.FC = () => {
     e.preventDefault();
     if (!isAdmin || !passwordResetModal.userId) return;
     const trimmedPass = passwordResetModal.newPassword.trim();
-    if (trimmedPass.length < 4) {
-      showAlert("Senha Inválida", "A nova senha deve conter pelo menos 4 caracteres.", "error");
+    if (trimmedPass.length < 6) {
+      showAlert("Senha Inválida", "A nova senha deve conter pelo menos 6 caracteres.", "error");
       return;
     }
 
@@ -1825,6 +1907,10 @@ const App: React.FC = () => {
     }
     if (!userFormData.name.trim() || !userFormData.username.trim() || !userFormData.password.trim()) {
       showAlert("Erro", "Nome completo, ID de usuário e senha inicial são obrigatórios.", "error");
+      return;
+    }
+    if (userFormData.password.trim().length < 6) {
+      showAlert("Senha Muito Curta", "A senha inicial deve ter pelo menos 6 caracteres (exigência do Supabase Auth).", "error");
       return;
     }
 
@@ -2994,7 +3080,7 @@ const App: React.FC = () => {
       .trim();
     const parts = clean.split(/\s+/).filter(Boolean);
     const baseUser = parts.length > 1 ? `${parts[0]}.${parts[parts.length - 1]}` : (parts[0] || 'cliente');
-    const randomPin = Math.floor(1000 + Math.random() * 9000).toString();
+    const randomPin = Math.floor(100000 + Math.random() * 900000).toString();
     return { username: baseUser, password: randomPin };
   };
 
@@ -3013,8 +3099,8 @@ const App: React.FC = () => {
         showAlert("Login Indisponível", `O login "${cleanUser}" já está sendo utilizado por outro cliente ou funcionário. Escolha outro login.`, "error");
         return;
       }
-      if (!clientFormData.password.trim()) {
-        showAlert("Senha Obrigatória", "Ao definir um Login de acesso para o cliente, informe também uma Senha.", "error");
+      if (!clientFormData.password.trim() || clientFormData.password.trim().length < 6) {
+        showAlert("Senha Inválida", "Ao definir um Login para o cliente, informe uma Senha com no mínimo 6 caracteres.", "error");
         return;
       }
     }
@@ -3112,8 +3198,8 @@ const App: React.FC = () => {
         showAlert("Login Indisponível", `O login "${cleanUser}" já está em uso. Escolha outro login para este cliente.`, "error");
         return;
       }
-      if (!(editingClient.password || '').trim()) {
-        showAlert("Senha Obrigatória", "Informe uma senha para o Login do cliente.", "error");
+      if (!(editingClient.password || '').trim() || (editingClient.password || '').trim().length < 6) {
+        showAlert("Senha Inválida", "Informe uma senha com no mínimo 6 caracteres para o Login do cliente.", "error");
         return;
       }
     }
@@ -5417,46 +5503,108 @@ const App: React.FC = () => {
             </div>
           )}
           
-          <form onSubmit={handleLogin} className="space-y-5">
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest px-1 italic">
-                {publicClientPassportId ? 'Login do Cliente' : 'Usuário ou Login de Cliente'}
-              </label>
-              <input 
-                type="text" 
-                className="w-full px-5 py-4 bg-zinc-800/50 border border-zinc-700 focus:border-green-500 rounded-2xl outline-none transition-all font-bold text-white"
-                value={loginForm.username}
-                onChange={e => setLoginForm({...loginForm, username: e.target.value})}
-                required
-                placeholder={publicClientPassportId ? 'Seu login de cliente' : 'Seu usuário ou login de cliente'}
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest px-1 italic">Senha de Segurança</label>
-              <input 
-                type="password" 
-                className="w-full px-5 py-4 bg-zinc-800/50 border border-zinc-700 focus:border-green-500 rounded-2xl outline-none transition-all font-bold text-white"
-                value={loginForm.password}
-                onChange={e => setLoginForm({...loginForm, password: e.target.value})}
-                required
-                placeholder="••••••••"
-              />
-            </div>
-            <button 
-              type="submit"
-              disabled={isLoading}
-              className="w-full py-4 sm:py-5 bg-green-500 hover:bg-green-400 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-black rounded-2xl shadow-glow transition-all mt-2 uppercase italic text-xs sm:text-sm flex items-center justify-center gap-3 active:scale-95"
-            >
-              {isLoading ? (
-                <>
-                  <RefreshCw className="animate-spin" size={18} />
-                  Autenticando...
-                </>
-              ) : (
-                publicClientPassportId ? "Acessar Espelho do Meu UTV" : "Autenticar Entrada"
-              )}
-            </button>
-          </form>
+          {pendingPasswordUpgrade ? (
+            <form onSubmit={handleCompletePasswordUpgrade} className="space-y-4">
+              <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-2xl space-y-1.5">
+                <div className="flex items-center gap-2 text-amber-400 font-black uppercase text-[10px] tracking-wider">
+                  <Key size={15} className="shrink-0" />
+                  <span>Atualização Obrigatória de Senha</span>
+                </div>
+                <p className="text-[11px] text-zinc-200 leading-relaxed">
+                  Sua senha atual de <strong className="text-white">{pendingPasswordUpgrade.username}</strong> foi validada! Para ativar sua conta no Supabase Auth, defina uma nova senha com <strong>no mínimo 6 caracteres</strong>.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest px-1 italic">Nova Senha (mín. 6 caracteres)</label>
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  autoFocus
+                  className="w-full px-5 py-4 bg-zinc-800/50 border border-zinc-700 focus:border-green-500 rounded-2xl outline-none transition-all font-bold text-white"
+                  value={pendingPasswordUpgrade.newPassword}
+                  onChange={e => setPendingPasswordUpgrade(prev => prev ? { ...prev, newPassword: e.target.value } : null)}
+                  placeholder="Mínimo 6 caracteres"
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest px-1 italic">Confirmar Nova Senha</label>
+                <input
+                  type="password"
+                  required
+                  minLength={6}
+                  className="w-full px-5 py-4 bg-zinc-800/50 border border-zinc-700 focus:border-green-500 rounded-2xl outline-none transition-all font-bold text-white"
+                  value={pendingPasswordUpgrade.confirmPassword}
+                  onChange={e => setPendingPasswordUpgrade(prev => prev ? { ...prev, confirmPassword: e.target.value } : null)}
+                  placeholder="Repita a nova senha"
+                />
+              </div>
+              <div className="flex gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setPendingPasswordUpgrade(null)}
+                  className="px-5 py-4 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 font-black rounded-2xl uppercase text-xs"
+                >
+                  Voltar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isLoading}
+                  className="flex-1 py-4 bg-green-500 hover:bg-green-400 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-black rounded-2xl shadow-glow transition-all uppercase italic text-xs sm:text-sm flex items-center justify-center gap-2 active:scale-95"
+                >
+                  {isLoading ? (
+                    <>
+                      <RefreshCw className="animate-spin" size={16} />
+                      Ativando...
+                    </>
+                  ) : (
+                    'Salvar e Entrar'
+                  )}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={handleLogin} className="space-y-5">
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest px-1 italic">
+                  {publicClientPassportId ? 'Login do Cliente' : 'Usuário ou Login de Cliente'}
+                </label>
+                <input 
+                  type="text" 
+                  className="w-full px-5 py-4 bg-zinc-800/50 border border-zinc-700 focus:border-green-500 rounded-2xl outline-none transition-all font-bold text-white"
+                  value={loginForm.username}
+                  onChange={e => setLoginForm({...loginForm, username: e.target.value})}
+                  required
+                  placeholder={publicClientPassportId ? 'Seu login de cliente' : 'Seu usuário ou login de cliente'}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-[10px] font-black text-zinc-400 uppercase tracking-widest px-1 italic">Senha de Segurança</label>
+                <input 
+                  type="password" 
+                  className="w-full px-5 py-4 bg-zinc-800/50 border border-zinc-700 focus:border-green-500 rounded-2xl outline-none transition-all font-bold text-white"
+                  value={loginForm.password}
+                  onChange={e => setLoginForm({...loginForm, password: e.target.value})}
+                  required
+                  placeholder="••••••••"
+                />
+              </div>
+              <button 
+                type="submit"
+                disabled={isLoading}
+                className="w-full py-4 sm:py-5 bg-green-500 hover:bg-green-400 disabled:bg-zinc-700 disabled:text-zinc-500 text-black font-black rounded-2xl shadow-glow transition-all mt-2 uppercase italic text-xs sm:text-sm flex items-center justify-center gap-3 active:scale-95"
+              >
+                {isLoading ? (
+                  <>
+                    <RefreshCw className="animate-spin" size={18} />
+                    Autenticando...
+                  </>
+                ) : (
+                  publicClientPassportId ? "Acessar Espelho do Meu UTV" : "Autenticar Entrada"
+                )}
+              </button>
+            </form>
+          )}
 
           <div className="mt-6 flex flex-col items-center gap-2 border-t border-zinc-800/50 pt-4">
             <div className="flex items-center gap-2">
@@ -6877,7 +7025,7 @@ const App: React.FC = () => {
                           <p className="text-[9px] font-black uppercase text-zinc-400 ml-2 tracking-wider">Senha do Cliente</p>
                           <input
                             type="text"
-                            placeholder="Ex: 1234"
+                            placeholder="Mín. 6 caracteres"
                             value={clientFormData.password}
                             onChange={e => setClientFormData({ ...clientFormData, password: e.target.value })}
                             className="w-full bg-black border border-zinc-800 focus:border-emerald-500 p-3.5 rounded-xl text-white font-mono font-bold text-xs outline-none"
@@ -7053,7 +7201,7 @@ const App: React.FC = () => {
                            <p className="text-[8px] font-black uppercase text-zinc-400 ml-1">Senha do Cliente</p>
                            <input
                              type="text"
-                             placeholder="Ex: 123"
+                             placeholder="Mín. 6 caracteres"
                              value={editingClient.password || ''}
                              onChange={e => setEditingClient({ ...editingClient, password: e.target.value })}
                              className="w-full bg-black border border-zinc-800 focus:border-emerald-500 p-3 rounded-xl text-white font-mono font-bold text-xs outline-none"
@@ -14264,7 +14412,7 @@ const App: React.FC = () => {
                   type="password"
                   required
                   autoFocus
-                  placeholder="Digite a nova senha (mín. 4 caracteres)"
+                  placeholder="Digite a nova senha (mín. 6 caracteres)"
                   value={passwordResetModal.newPassword}
                   onChange={e => setPasswordResetModal(prev => ({ ...prev, newPassword: e.target.value }))}
                   className="w-full bg-black border border-zinc-800 focus:border-green-500 p-4 rounded-xl text-white font-bold text-sm outline-none transition-colors"

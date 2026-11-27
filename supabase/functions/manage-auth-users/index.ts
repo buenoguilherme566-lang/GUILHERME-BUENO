@@ -151,13 +151,23 @@ Deno.serve(async (req: Request) => {
         return jsonResponse(req, 401, { error: 'Usuário ou senha incorretos.' });
       }
 
+      const requestedNewPassword = payload.newPassword ? String(payload.newPassword).trim() : '';
+      const effectivePassword = requestedNewPassword || password;
+      if (effectivePassword.length < 6) {
+        return jsonResponse(req, 422, {
+          requiresPasswordUpgrade: true,
+          error: 'Sua senha atual tem menos de 6 caracteres. Defina uma nova senha (mín. 6 caracteres) para ativar o acesso no Supabase Auth.'
+        });
+      }
+
       const authEmail = staff.authEmail || makeStaffAuthEmail(staff.username);
       const normalizedRole = normalizeStaffRole(staff.role);
       const tenantId = staff.tenantId || 'tenant_matriz_hps';
 
+      let targetAuthUserId: string | null = null;
       const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
         email: authEmail,
-        password,
+        password: effectivePassword,
         email_confirm: true,
         app_metadata: {
           accountType: 'STAFF',
@@ -171,19 +181,51 @@ Deno.serve(async (req: Request) => {
         }
       });
 
-      if (createErr || !created?.user?.id) {
+      if (created?.user?.id) {
+        targetAuthUserId = created.user.id;
+      } else if (createErr && /already.*(registered|exists)/i.test(createErr.message || '')) {
+        const { data: listData } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
+        const existingAuth = (listData?.users || []).find(
+          (u: any) => String(u.email || '').toLowerCase() === authEmail.toLowerCase()
+        );
+        if (existingAuth && (!existingAuth.app_metadata?.appUserId || existingAuth.app_metadata.appUserId === staff.id)) {
+          const { error: updAuthErr } = await supabaseAdmin.auth.admin.updateUserById(existingAuth.id, {
+            password: effectivePassword,
+            email_confirm: true,
+            app_metadata: {
+              accountType: 'STAFF',
+              role: normalizedRole,
+              tenantId,
+              appUserId: staff.id
+            },
+            user_metadata: {
+              name: staff.name,
+              username: staff.username
+            }
+          });
+          if (!updAuthErr) {
+            targetAuthUserId = existingAuth.id;
+          }
+        }
+      }
+
+      if (!targetAuthUserId) {
         return jsonResponse(req, 500, { error: createErr?.message || 'Falha ao provisionar usuário no Supabase Auth.' });
       }
 
-      await supabaseAdmin
+      const { error: linkErr } = await supabaseAdmin
         .from('users')
         .update({
-          authUserId: created.user.id,
+          authUserId: targetAuthUserId,
           authEmail,
           role: normalizedRole,
           password: null
         })
         .eq('id', staff.id);
+
+      if (linkErr) {
+        return jsonResponse(req, 500, { error: `Falha ao vincular authUserId no perfil: ${linkErr.message}` });
+      }
 
       return jsonResponse(req, 200, {
         migrated: true,
@@ -217,12 +259,22 @@ Deno.serve(async (req: Request) => {
         return jsonResponse(req, 401, { error: 'Login ou senha de cliente incorretos.' });
       }
 
+      const requestedNewClientPass = payload.newPassword ? String(payload.newPassword).trim() : '';
+      const effectiveClientPass = requestedNewClientPass || password.trim();
+      if (effectiveClientPass.length < 6) {
+        return jsonResponse(req, 422, {
+          requiresPasswordUpgrade: true,
+          error: 'O Supabase Auth exige senha com no mínimo 6 caracteres. Defina uma nova senha para concluir seu acesso.'
+        });
+      }
+
       const authEmail = clientRow.authEmail || makeClientAuthEmail(clientRow.username);
       const tenantId = clientRow.tenantId || 'tenant_matriz_hps';
 
+      let targetClientAuthId: string | null = null;
       const { data: createdClient, error: createClientErr } = await supabaseAdmin.auth.admin.createUser({
         email: authEmail,
-        password: password.trim(),
+        password: effectiveClientPass,
         email_confirm: true,
         app_metadata: {
           accountType: 'CLIENT',
@@ -236,17 +288,50 @@ Deno.serve(async (req: Request) => {
         }
       });
 
-      if (createClientErr || !createdClient?.user?.id) {
+      if (createdClient?.user?.id) {
+        targetClientAuthId = createdClient.user.id;
+      } else if (createClientErr && /already.*(registered|exists)/i.test(createClientErr.message || '')) {
+        const { data: listData } = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 1000 });
+        const existingAuth = (listData?.users || []).find(
+          (u: any) => String(u.email || '').toLowerCase() === authEmail.toLowerCase()
+        );
+        if (existingAuth && (!existingAuth.app_metadata?.clientId || existingAuth.app_metadata.clientId === clientRow.id)) {
+          const { error: updAuthErr } = await supabaseAdmin.auth.admin.updateUserById(existingAuth.id, {
+            password: effectiveClientPass,
+            email_confirm: true,
+            app_metadata: {
+              accountType: 'CLIENT',
+              role: 'CLIENT',
+              tenantId,
+              clientId: clientRow.id
+            },
+            user_metadata: {
+              name: clientRow.name,
+              username: clientRow.username
+            }
+          });
+          if (!updAuthErr) {
+            targetClientAuthId = existingAuth.id;
+          }
+        }
+      }
+
+      if (!targetClientAuthId) {
         return jsonResponse(req, 500, { error: createClientErr?.message || 'Falha ao provisionar cliente no Supabase Auth.' });
       }
 
-      await supabaseAdmin
+      const { error: linkClientErr } = await supabaseAdmin
         .from('clients')
         .update({
-          authUserId: createdClient.user.id,
-          authEmail
+          authUserId: targetClientAuthId,
+          authEmail,
+          ...(requestedNewClientPass ? { password: requestedNewClientPass } : {})
         })
         .eq('id', clientRow.id);
+
+      if (linkClientErr) {
+        return jsonResponse(req, 500, { error: `Falha ao vincular cliente no Auth: ${linkClientErr.message}` });
+      }
 
       return jsonResponse(req, 200, {
         migrated: true,
@@ -325,6 +410,9 @@ Deno.serve(async (req: Request) => {
     let authEmail: string | null = existing?.authEmail || null;
 
     if (clientUsername) {
+      if (clientPassword && clientPassword.length < 6) {
+        return jsonResponse(req, 400, { error: 'A senha de acesso do cliente deve ter pelo menos 6 caracteres (exigência do Supabase Auth).' });
+      }
       authEmail = authEmail || makeClientAuthEmail(clientUsername);
       if (authUserId) {
         const updateAttrs: Record<string, unknown> = {
@@ -341,14 +429,14 @@ Deno.serve(async (req: Request) => {
             username: clientUsername
           }
         };
-        if (clientPassword.length >= 4) {
+        if (clientPassword.length >= 6) {
           updateAttrs.password = clientPassword;
         }
         const { error: updErr } = await supabaseAdmin.auth.admin.updateUserById(authUserId, updateAttrs);
         if (updErr) {
           return jsonResponse(req, 500, { error: updErr.message });
         }
-      } else if (clientPassword.length >= 4) {
+      } else if (clientPassword.length >= 6) {
         const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
           email: authEmail,
           password: clientPassword,
@@ -431,8 +519,8 @@ Deno.serve(async (req: Request) => {
     const email = userData.email ? String(userData.email).trim() : null;
     const tenantId = String(userData.tenantId || callerTenantId);
 
-    if (!id || !name || !username || password.length < 4) {
-      return jsonResponse(req, 400, { error: 'Nome, usuário e senha (mín. 4 caracteres) são obrigatórios.' });
+    if (!id || !name || !username || password.length < 6) {
+      return jsonResponse(req, 400, { error: 'Nome, usuário e senha (mín. 6 caracteres) são obrigatórios.' });
     }
 
     const authEmail = makeStaffAuthEmail(username);
@@ -479,8 +567,8 @@ Deno.serve(async (req: Request) => {
   if (action === 'reset_staff_password') {
     const userId = String(payload.userId || '').trim();
     const newPassword = String(payload.newPassword || '').trim();
-    if (!userId || newPassword.length < 4) {
-      return jsonResponse(req, 400, { error: 'ID do usuário e nova senha (mín. 4 caracteres) são obrigatórios.' });
+    if (!userId || newPassword.length < 6) {
+      return jsonResponse(req, 400, { error: 'ID do usuário e nova senha (mín. 6 caracteres) são obrigatórios.' });
     }
 
     const { data: userRows } = await supabaseAdmin

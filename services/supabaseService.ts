@@ -1295,7 +1295,14 @@ NOTIFY pgrst, 'reload schema';
     } catch {}
     return await this.getUTVPassportById(cleanVal);
   },
-  async invokeAuthEdgeFunction(body: Record<string, unknown>): Promise<{ ok: boolean; data?: any; edgeUnavailable?: boolean; error?: string }> {
+  async invokeAuthEdgeFunction(body: Record<string, unknown>): Promise<{
+    ok: boolean;
+    data?: any;
+    edgeUnavailable?: boolean;
+    requiresPasswordUpgrade?: boolean;
+    gatewayJwtBlocked?: boolean;
+    error?: string;
+  }> {
     if (!supabase) return { ok: false, edgeUnavailable: true, error: 'Supabase não inicializado.' };
     try {
       const { data, error } = await supabase.functions.invoke('manage-auth-users', { body });
@@ -1310,12 +1317,33 @@ NOTIFY pgrst, 'reload schema';
         ) {
           return { ok: false, edgeUnavailable: true, error: msg };
         }
-        let parsedError = msg;
+        let ctxBody: any = null;
         try {
-          const ctxBody = await (error as any)?.context?.json?.();
-          if (ctxBody?.error) parsedError = ctxBody.error;
+          ctxBody = await (error as any)?.context?.json?.();
         } catch {}
-        return { ok: false, error: parsedError || 'Erro na Edge Function.' };
+        const parsedError = String(ctxBody?.error || ctxBody?.message || ctxBody?.msg || msg || 'Erro na Edge Function.');
+        if (status === 401 && /invalid jwt/i.test(parsedError)) {
+          return {
+            ok: false,
+            gatewayJwtBlocked: true,
+            error: 'A Edge Function "manage-auth-users" está com "Verify JWT" ativado no Supabase. Desative essa opção em Edge Functions → manage-auth-users → Details/Settings.'
+          };
+        }
+        if (ctxBody?.requiresPasswordUpgrade) {
+          return {
+            ok: false,
+            requiresPasswordUpgrade: true,
+            error: parsedError
+          };
+        }
+        return { ok: false, error: parsedError };
+      }
+      if (data?.requiresPasswordUpgrade) {
+        return {
+          ok: false,
+          requiresPasswordUpgrade: true,
+          error: String(data.error || 'Defina uma nova senha com no mínimo 6 caracteres.')
+        };
       }
       if (data?.error) {
         return { ok: false, error: String(data.error) };
@@ -1330,40 +1358,54 @@ NOTIFY pgrst, 'reload schema';
       };
     }
   },
-  async signInWithAuthOrMigrate(identifier: string, password: string): Promise<{
+  async signInWithAuthOrMigrate(identifier: string, password: string, newPassword?: string): Promise<{
     user: User | null;
     authMode: 'supabase_auth' | 'legacy_rpc';
     edgeUnavailable?: boolean;
+    requiresPasswordUpgrade?: boolean;
+    gatewayJwtBlocked?: boolean;
     error?: string;
   }> {
     const client = getClient();
     const cleanId = identifier.trim().toLowerCase();
     const slug = cleanId.replace(/[^a-z0-9._-]/g, '_');
 
+    let resolvedMigratedEmail: string | null = null;
     const candidateEmails: string[] = [];
     try {
       const { data: resolved } = await client.rpc('resolve_auth_login', { p_identifier: cleanId });
       if (Array.isArray(resolved) && resolved.length > 0 && resolved[0]?.authEmail) {
-        candidateEmails.push(String(resolved[0].authEmail).toLowerCase());
+        resolvedMigratedEmail = String(resolved[0].authEmail).toLowerCase();
+        candidateEmails.push(resolvedMigratedEmail);
       }
     } catch {}
 
-    if (cleanId.includes('@')) {
-      if (!candidateEmails.includes(cleanId)) candidateEmails.push(cleanId);
-    } else {
-      const staffCandidate = `${slug}@staff.hps.local`;
-      const clientCandidate = `${slug}@client.hps.local`;
-      if (!candidateEmails.includes(staffCandidate)) candidateEmails.push(staffCandidate);
-      if (!candidateEmails.includes(clientCandidate)) candidateEmails.push(clientCandidate);
-    }
+    if (!newPassword) {
+      if (cleanId.includes('@')) {
+        if (!candidateEmails.includes(cleanId)) candidateEmails.push(cleanId);
+      } else {
+        const staffCandidate = `${slug}@staff.hps.local`;
+        const clientCandidate = `${slug}@client.hps.local`;
+        if (!candidateEmails.includes(staffCandidate)) candidateEmails.push(staffCandidate);
+        if (!candidateEmails.includes(clientCandidate)) candidateEmails.push(clientCandidate);
+      }
 
-    for (const email of candidateEmails) {
-      const { data: authRes, error: authErr } = await client.auth.signInWithPassword({ email, password });
-      if (!authErr && authRes?.session) {
-        const profile = await this.getAuthenticatedProfile();
-        if (profile) {
-          return { user: profile, authMode: 'supabase_auth' };
+      for (const email of candidateEmails) {
+        const { data: authRes, error: authErr } = await client.auth.signInWithPassword({ email, password });
+        if (!authErr && authRes?.session) {
+          const profile = await this.getAuthenticatedProfile();
+          if (profile) {
+            return { user: profile, authMode: 'supabase_auth' };
+          }
         }
+      }
+
+      if (resolvedMigratedEmail) {
+        return {
+          user: null,
+          authMode: 'supabase_auth',
+          error: 'Usuário ou senha incorretos.'
+        };
       }
     }
 
@@ -1371,13 +1413,14 @@ NOTIFY pgrst, 'reload schema';
     const migRes = await this.invokeAuthEdgeFunction({
       action: 'migrate_on_login',
       identifier: cleanId,
-      password
+      password,
+      ...(newPassword ? { newPassword } : {})
     });
 
     if (migRes.ok && migRes.data?.authEmail) {
       const { data: authAfterMig, error: loginAfterMigErr } = await client.auth.signInWithPassword({
         email: String(migRes.data.authEmail),
-        password
+        password: newPassword || password
       });
       if (!loginAfterMigErr && authAfterMig?.session) {
         const profile = await this.getAuthenticatedProfile();
@@ -1385,12 +1428,19 @@ NOTIFY pgrst, 'reload schema';
           return { user: profile, authMode: 'supabase_auth' };
         }
       }
+      return {
+        user: null,
+        authMode: 'supabase_auth',
+        error: loginAfterMigErr?.message || 'Conta vinculada, mas não foi possível carregar o perfil autenticado.'
+      };
     }
 
     return {
       user: null,
       authMode: 'legacy_rpc',
       edgeUnavailable: migRes.edgeUnavailable,
+      requiresPasswordUpgrade: migRes.requiresPasswordUpgrade,
+      gatewayJwtBlocked: migRes.gatewayJwtBlocked,
       error: migRes.error
     };
   },
