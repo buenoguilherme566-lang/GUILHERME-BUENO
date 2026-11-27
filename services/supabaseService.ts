@@ -796,7 +796,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, extensions;
 
 DROP TRIGGER IF EXISTS trg_hash_password ON users;
 CREATE TRIGGER trg_hash_password
@@ -831,13 +831,14 @@ BEGIN
           OR u.password = p_password
       );
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, extensions;
 
 DROP FUNCTION IF EXISTS authenticate_client_mirror(TEXT, TEXT);
 CREATE OR REPLACE FUNCTION authenticate_client_mirror(p_username TEXT, p_password TEXT)
 RETURNS SETOF clients
 LANGUAGE sql
 SECURITY DEFINER
+SET search_path = public, extensions
 AS $$
   SELECT *
   FROM clients

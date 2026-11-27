@@ -1762,6 +1762,11 @@ const App: React.FC = () => {
       setLaborTemplates([]);
       setClients([]);
       setUtvPassports([]);
+      try {
+        localStorage.removeItem(`${DB_KEY}_${currentTenant.id}`);
+        localStorage.removeItem("HPS_TENANTS_V12");
+      } catch {}
+      idbSet(`${DB_KEY}_${currentTenant.id}`, null);
     }
   };
 

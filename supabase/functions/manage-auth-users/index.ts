@@ -401,11 +401,14 @@ Deno.serve(async (req: Request) => {
 
     const { data: existingRows } = await supabaseAdmin
       .from('clients')
-      .select('id, "authUserId", "authEmail"')
+      .select('id, "tenantId", "authUserId", "authEmail"')
       .eq('id', clientId)
       .limit(1);
 
     const existing = Array.isArray(existingRows) && existingRows.length > 0 ? existingRows[0] : null;
+    if (existing && !callerIsAdmin && (existing.tenantId || 'tenant_matriz_hps') !== callerTenantId) {
+      return jsonResponse(req, 403, { error: 'Sem permissão para alterar cliente de outra oficina.' });
+    }
     let authUserId: string | null = existing?.authUserId || null;
     let authEmail: string | null = existing?.authEmail || null;
 
@@ -502,7 +505,10 @@ Deno.serve(async (req: Request) => {
       .limit(1);
 
     const existing = Array.isArray(existingRows) && existingRows.length > 0 ? existingRows[0] : null;
-    await supabaseAdmin.from('clients').delete().eq('id', clientId);
+    const { error: delClientErr } = await supabaseAdmin.from('clients').delete().eq('id', clientId);
+    if (delClientErr) {
+      return jsonResponse(req, 500, { error: delClientErr.message });
+    }
     if (existing?.authUserId) {
       await supabaseAdmin.auth.admin.deleteUser(existing.authUserId);
     }
@@ -640,7 +646,10 @@ Deno.serve(async (req: Request) => {
       .limit(1);
 
     const target = Array.isArray(targetRows) && targetRows.length > 0 ? targetRows[0] : null;
-    await supabaseAdmin.from('users').delete().eq('id', userId);
+    const { error: delStaffErr } = await supabaseAdmin.from('users').delete().eq('id', userId);
+    if (delStaffErr) {
+      return jsonResponse(req, 500, { error: delStaffErr.message });
+    }
     if (target?.authUserId) {
       await supabaseAdmin.auth.admin.deleteUser(target.authUserId);
     }
